@@ -9,6 +9,7 @@ import List.Nonempty as NE
 import Pivot exposing (Pivot)
 import Svg exposing (Svg)
 import Svg.Attributes as SA
+import Time
 
 
 main : Program () Model Msg
@@ -22,29 +23,32 @@ main =
 
 
 type alias Model =
-    {}
+    { drivers : List Driver }
 
 
 init : () -> ( Model, Cmd Msg )
 init () =
-    ( {}, Cmd.none )
+    ( { drivers = initialDrivers
+      }
+    , Cmd.none
+    )
 
 
 type Msg
-    = Msg
+    = Tick
 
 
 subscriptions : Model -> Sub Msg
 subscriptions _ =
     Sub.batch
-        []
+        [ Time.every 500 (always Tick) ]
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        Msg ->
-            ( model, Cmd.none )
+        Tick ->
+            ( { model | drivers = List.map stepDriver model.drivers }, Cmd.none )
 
 
 type alias GP =
@@ -84,7 +88,7 @@ view model =
                 ]
                 ((allGPs |> List.map viewCellBorder)
                     ++ (buildings |> List.map viewBuilding)
-                    ++ (drivers |> List.map viewDriver)
+                    ++ (model.drivers |> List.map viewDriver)
                 )
             ]
         ]
@@ -168,62 +172,191 @@ viewCellBorder gp =
         ]
 
 
+type Dir
+    = -- Up
+      -- | Down
+      -- | Left
+      -- |
+      Right
+
+
+dirToOffset : Dir -> Int2
+dirToOffset dir =
+    case dir of
+        Right ->
+            ( 1, 0 )
+
+
+type Road
+    = Road (NE GP)
+
+
+initStraightRoad : GP -> Dir -> Int -> Road
+initStraightRoad from dir len_ =
+    let
+        len =
+            clamp 4 7 len_
+
+        pathRest =
+            times len (\i -> tscale i (dirToOffset dir) |> add2 from)
+                |> List.drop 1
+    in
+    Road ( from, pathRest )
+
+
+roadEndpoints (Road ( head, tail )) =
+    ( head, List.reverse tail |> List.head |> Maybe.withDefault head )
+
+
+roadToNE (Road ne) =
+    ne
+
+
+type alias Order =
+    { from : GP
+    , to : GP
+    }
+
+
 type alias Driver =
     { id : Int
     , pos : Pivot GP
     , endpoints : ( GP, GP )
+    , state : DriverState
+    , pendingOrders : List Order
     }
 
 
-drivers =
-    [ ( ( 2, 3 ), ( 1, 0 ), 6 )
+type DriverState
+    = Idle
+    | Pickingup Order
+    | Delivering Order
+
+
+initialDrivers : List Driver
+initialDrivers =
+    [ initStraightRoad ( 2, 3 ) Right 6
     ]
         |> List.indexedMap initDriver
 
 
-initDriver : Int -> ( GP, GP, Int ) -> Driver
-initDriver id ( endpoint1, dir_, len_ ) =
-    let
-        dir =
-            tmap (clamp -1 1) dir_
-
-        len =
-            clamp 4 7 len_
-
-        endpoint2 =
-            tscale (len - 1) dir |> add2 endpoint1
-
-        pathStart =
-            add2 endpoint1 dir
-
-        pathRest =
-            times (len - 3) (\i -> tscale (i + 1) dir |> add2 pathStart)
-    in
+initDriver : Int -> Road -> Driver
+initDriver id road =
     { id = id
-    , pos = Pivot.fromCons pathStart pathRest
-    , endpoints = ( endpoint1, endpoint2 )
+    , pos = roadToNE road |> uncurry Pivot.fromCons
+    , endpoints = roadEndpoints road
+    , state = Idle
+    , pendingOrders =
+        let
+            ( from, to ) =
+                roadEndpoints road
+
+            o =
+                { from = from, to = to }
+
+            ro =
+                { from = to, to = from }
+        in
+        List.intersperse ro (List.repeat 5 o)
     }
+
+
+driverPathGPs : Driver -> List GP
+driverPathGPs d =
+    Pivot.toList d.pos
+
+
+driverEndpoints : Driver -> ( GP, GP )
+driverEndpoints d =
+    d.endpoints
+
+
+stepDriver : Driver -> Driver
+stepDriver d =
+    case d.state of
+        Idle ->
+            processPendingOrders d
+
+        Pickingup o ->
+            if Pivot.getC d.pos == o.from then
+                { d | state = Delivering o }
+
+            else
+                { d | pos = moveTowards o.from d.pos }
+
+        Delivering o ->
+            if Pivot.getC d.pos == o.to then
+                processPendingOrders { d | state = Idle }
+
+            else
+                { d | pos = moveTowards o.to d.pos }
+
+
+processPendingOrders d =
+    case d.pendingOrders of
+        o :: pendingOrders ->
+            { d | state = Pickingup o, pendingOrders = pendingOrders }
+
+        [] ->
+            d
+
+
+moveTowards gp pos =
+    if Pivot.getR pos |> List.member gp then
+        withRollback Pivot.goR pos
+
+    else if Pivot.getL pos |> List.member gp then
+        moveTowards gp (Pivot.reverse pos)
+
+    else
+        Debug.todo "impl"
+
+
+withRollback =
+    Pivot.withRollback
 
 
 viewDriver : Driver -> Html Msg
 viewDriver d =
     let
         ( endpoint1, endpoint2 ) =
-            d.endpoints
+            driverEndpoints d
 
         roadPath =
-            endpoint1 :: Pivot.toList d.pos ++ [ endpoint2 ]
+            driverPathGPs d
     in
     group []
         [ viewRoad roadPath
         , viewRoadEndpoint endpoint1
         , viewRoadEndpoint endpoint2
-        , viewDriver_ (Pivot.getC d.pos)
+        , viewVehicle (Pivot.getC d.pos) d.state
         ]
 
 
-viewDriver_ gp =
-    square driverDiameter [ styleTranslate (gpToWorld gp), stroke strokeColor, strokeWidth strokeThickness, fill colorHQGray ]
+viewVehicle gp state =
+    group
+        [ styleTranslate (gpToWorld gp)
+        , style "transition" "translate 500ms linear, scale 500ms linear"
+        , stroke strokeColor
+        , strokeWidth strokeThickness
+        ]
+        [ square driverDiameter [ fill colorHQGray ]
+        , circleWithDiameter driverDiameter
+            [ fill colorWater
+            , style "transition" "translate 500ms linear, scale 500ms linear"
+            , style "scale"
+                (case state of
+                    Idle ->
+                        "0"
+
+                    Pickingup _ ->
+                        "0"
+
+                    Delivering _ ->
+                        "1"
+                )
+            ]
+        ]
 
 
 viewRoad : List GP -> Html Msg
