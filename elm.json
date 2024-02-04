@@ -12,6 +12,8 @@
             "elm/html": "1.0.0",
             "elm/svg": "1.0.1",
             "elm/time": "1.0.0",
+            "elm-community/list-extra": "8.7.0",
+            "elm-community/maybe-extra": "5.3.0",
             "yotamDvir/elm-pivot": "3.1.0"
         },
         "indirect": {
@@ -19,7 +21,6 @@
             "elm/random": "1.0.0",
             "elm/url": "1.0.0",
             "elm/virtual-dom": "1.0.3",
-            "elm-community/list-extra": "8.7.0",
             "elm-explorations/test": "1.2.2"
         }
     },
