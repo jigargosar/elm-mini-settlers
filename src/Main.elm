@@ -25,8 +25,9 @@ main =
 
 
 type alias Model =
-    { drivers : List Driver
+    { drivers : Drivers
     , buildings : List Building
+    , step : Int
     }
 
 
@@ -34,9 +35,19 @@ init : () -> ( Model, Cmd Msg )
 init () =
     ( { drivers = initialDrivers
       , buildings = initialBuildings
+      , step = 0
       }
+      -- |> applyN 14 updateOnTick
     , Cmd.none
     )
+
+
+applyN n fn a =
+    if n <= 0 then
+        a
+
+    else
+        applyN (n - 1) fn (fn a)
 
 
 type Msg
@@ -53,47 +64,143 @@ update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
         Tick ->
-            let
-                ( drivers, events ) =
-                    List.map stepDriver model.drivers
-                        |> List.unzip
-                        |> Tuple.mapSecond (List.filterMap identity)
-
-                ( drivers2, buildings ) =
-                    List.foldl processDriverEvent ( drivers, model.buildings ) events
-            in
-            ( { model | drivers = drivers2, buildings = buildings }
+            ( updateOnTick model
             , Cmd.none
             )
 
 
+updateOnTick model =
+    -- let
+    --     ( drivers, events ) =
+    --         List.map stepDriver model.drivers
+    --             |> List.unzip
+    --             |> Tuple.mapSecond (List.filterMap identity)
+    --     ( drivers2, buildings ) =
+    --         List.foldl processDriverEvent ( drivers, model.buildings ) events
+    -- in
+    -- { model | drivers = drivers2, buildings = buildings, step = model.step + 1 }
+    model
+        |> incStepCount
+        |> createAndAssignOrders
+        |> stepDrivers
+
+
+incStepCount model =
+    { model | step = model.step + 1 }
+
+
+stepDrivers model =
+    let
+        ( drivers, events ) =
+            List.map stepDriver model.drivers
+                |> List.unzip
+                |> Tuple.mapSecond (List.filterMap identity)
+    in
+    { model | drivers = drivers } |> processDriverEvents events
+
+
+createAndAssignOrders model =
+    -- assign orders to buildings and drivers
+    let
+        newOrders : List Order
+        newOrders =
+            createOrders model
+    in
+    model |> assignOrders newOrders
+
+
+createOrders model =
+    -- [ o04, o03, o01, o01, o10, o10 ]
+    -- [ o01, o01, o10, o10 ]
+    if model.step == 1 then
+        [ o01 ]
+
+    else
+        []
+
+
+assignOrders orders model =
+    List.foldl assignOrder model orders
+
+
+assignOrder : Order -> Model -> Model
+assignOrder order model =
+    { model | drivers = driversAssignOrderTo order.initialDriverId order model.drivers }
+
+
+processDriverEvents events model =
+    let
+        ( drivers, buildings ) =
+            List.foldl processDriverEvent ( model.drivers, model.buildings ) events
+    in
+    { model | drivers = drivers, buildings = buildings }
+
+
 processDriverEvent e ( drivers, buildings ) =
     case e of
-        DeliveredOrder o ->
-            case o.plan |> Pivot.getC |> .to of
-                DR { id } ->
+        AtEndOf deliveryLeg o ->
+            case ( deliveryLeg, o.plan ) of
+                ( Dropoff, MultiStep B2D p ) ->
                     let
-                        updatedPlan =
-                            o.plan |> Pivot.goR |> ME.withDefaultLazy (\_ -> Debug.todo "impl")
-
                         updatedOrder =
-                            { o | plan = updatedPlan }
+                            case p.steps of
+                                [] ->
+                                    { o | plan = MultiStep D2B p }
+
+                                h :: t ->
+                                    { o | plan = MultiStep (D2D ( h, t )) p }
+
+                        nextDriverId =
+                            p.first.to.id
                     in
                     ( drivers
-                        |> updateExactlyOne (.id >> eq id) (\d -> { d | pendingOrders = d.pendingOrders ++ [ updatedOrder ] })
+                        |> updateDriverById nextDriverId (\d -> { d | pendingOrders = d.pendingOrders ++ [ updatedOrder ] })
+                    , buildings
+                    )
+
+                ( Dropoff, MultiStep (D2D ( step, pendingSteps )) p ) ->
+                    let
+                        updatedOrder =
+                            case pendingSteps of
+                                [] ->
+                                    { o | plan = MultiStep D2B p }
+
+                                h :: t ->
+                                    { o | plan = MultiStep (D2D ( h, t )) p }
+
+                        nextDriverId =
+                            step.to.id
+                    in
+                    ( drivers
+                        |> updateDriverById nextDriverId (driverAssignOrder updatedOrder)
+                    , buildings
+                    )
+
+                ( Pickup, MultiStep D2B p ) ->
+                    let
+                        prevDriverId =
+                            p.last.from.id
+                    in
+                    ( drivers
+                        |> updateDriverById prevDriverId (\d -> driverHandoverComplete o.id d)
+                    , buildings
+                    )
+
+                ( Pickup, MultiStep (D2D ( step, _ )) p ) ->
+                    let
+                        prevDriverId =
+                            step.from.id
+                    in
+                    ( drivers
+                        |> updateDriverById prevDriverId (\d -> driverHandoverComplete o.id d)
                     , buildings
                     )
 
                 _ ->
                     ( drivers, buildings )
 
-        _ ->
-            ( drivers, buildings )
-
 
 updateExactlyOne pred fn list =
-    -- TODO: ensure one
-    -- LE.updateIf pred fn list
     let
         _ =
             if LE.count pred list == 1 then
@@ -103,17 +210,6 @@ updateExactlyOne pred fn list =
                 Debug.todo "impl"
     in
     LE.updateIf pred fn list
-
-
-
--- LE.count pred list
---     |> Just
---     |> ME.filter (eq 1)
---     |> Maybe.map
---         (\_ ->
---             LE.updateIf pred fn list
---         )
---     |> ME.withDefaultLazy (\_ -> Debug.todo "impl")
 
 
 type alias GP =
@@ -141,7 +237,7 @@ view : Model -> Html Msg
 view model =
     div []
         [ globalStyles
-        , div [ style "padding" "20px" ]
+        , div [ style "padding" "10px" ]
             [ Svg.svg
                 [ SA.viewBox "-25 -25 500 500"
 
@@ -156,6 +252,8 @@ view model =
                     ++ (model.drivers |> List.map viewDriver)
                 )
             ]
+
+        -- , div [ style "padding" "10px" ] [ text "steps: ", text (String.fromInt model.step) ]
         ]
 
 
@@ -285,17 +383,47 @@ roadToNE (Road ne) =
     ne
 
 
-type alias Step =
-    { from : Node, to : Node }
+type alias OrderId =
+    Int
 
 
-initBBStep a b =
-    { from = BR (buildingToRef a), to = BR (buildingToRef b) }
+type alias Order =
+    { id : OrderId
+    , resource : Resource
+    , initialDriverId : DriverId
+    , plan : Plan
+    }
+
+
+type Plan
+    = SingleStep BuildingRef BuildingRef
+    | MultiStep CurrentStep MultiStepPlan
+
+
+initSingleStepPlan a b =
+    SingleStep (buildingToRef a) (buildingToRef b)
+
+
+type alias MultiStepPlan =
+    { first : { from : BuildingRef, to : DriverRef }
+    , steps : List { from : DriverRef, to : DriverRef }
+    , last : { from : DriverRef, to : BuildingRef }
+    }
+
+
+type CurrentStep
+    = B2D
+    | D2D (NE { from : DriverRef, to : DriverRef })
+    | D2B
 
 
 type Node
     = BR BuildingRef
     | DR DriverRef
+
+
+initBuildingNode =
+    buildingToRef >> BR
 
 
 nodeGP n =
@@ -307,22 +435,104 @@ nodeGP n =
             gp
 
 
-initBuildingNode =
-    buildingToRef >> BR
+orderCurrentDestinationGPForDeliveryLeg : DeliveryLeg -> Order -> GP
+orderCurrentDestinationGPForDeliveryLeg deliveryLeg o =
+    orderCurrentNodeForDeliveryLeg deliveryLeg o |> nodeGP
 
 
-type alias DriverRef =
-    { id : Int, gp : GP }
+orderCurrentNodeForDeliveryLeg : DeliveryLeg -> Order -> Node
+orderCurrentNodeForDeliveryLeg deliveryLeg o =
+    case deliveryLeg of
+        Pickup ->
+            orderCurrentPickupNode o
+
+        Dropoff ->
+            orderCurrentDeliveryNode o
 
 
-type alias Order =
-    { resource : Resource
-    , plan : Pivot Step
+orderCurrentPickupNode : Order -> Node
+orderCurrentPickupNode o =
+    case o.plan of
+        SingleStep br _ ->
+            BR br
+
+        MultiStep B2D p ->
+            BR p.first.from
+
+        MultiStep D2B p ->
+            DR p.last.from
+
+        MultiStep (D2D ( h, _ )) p ->
+            DR h.from
+
+
+orderCurrentDeliveryNode : Order -> Node
+orderCurrentDeliveryNode o =
+    case o.plan of
+        SingleStep _ br ->
+            BR br
+
+        MultiStep B2D p ->
+            DR p.first.to
+
+        MultiStep D2B p ->
+            BR p.last.to
+
+        MultiStep (D2D ( h, _ )) p ->
+            DR h.to
+
+
+initOrder : OrderId -> Building -> Building -> Resource -> Order
+initOrder id from to resource =
+    { id = id, initialDriverId = 0, resource = resource, plan = initSingleStepPlan from to }
+
+
+o01 =
+    initOrder 0 b0 b1 Water
+
+
+o10 =
+    initOrder 1 b1 b0 Wood
+
+
+o03 : Order
+o03 =
+    { id = 2
+    , resource = Water
+    , initialDriverId = 0
+    , plan =
+        MultiStep B2D
+            { first = { from = buildingToRef b0, to = { id = 1, gp = ( 6, 3 ) } }
+            , steps = []
+            , last = { from = { id = 0, gp = ( 7, 4 ) }, to = buildingToRef b3 }
+            }
     }
 
 
+o04 : Order
+o04 =
+    { id = 3
+    , resource = Water
+    , initialDriverId = 0
+    , plan =
+        MultiStep B2D
+            { first = { from = buildingToRef b0, to = { id = 1, gp = ( 6, 3 ) } }
+            , steps = [ { from = { id = 0, gp = ( 7, 4 ) }, to = { id = 2, gp = ( 7, 7 ) } } ]
+            , last = { from = { id = 1, gp = ( 6, 8 ) }, to = buildingToRef b4 }
+            }
+    }
+
+
+
+-- DRIVER
+
+
+type alias DriverId =
+    Int
+
+
 type alias Driver =
-    { id : Int
+    { id : DriverId
     , pos : Pivot GP
     , endpoints : ( GP, GP )
     , state : DriverState
@@ -330,20 +540,23 @@ type alias Driver =
     }
 
 
+type alias DriverRef =
+    { id : Int, gp : GP }
+
+
 type DriverState
     = Idle
-    | Pickingup Order
-    | Delivering Order
+    | InTransitFor DeliveryLeg Order
     | WaitingForHandover Order
 
 
-initialDrivers : List Driver
-initialDrivers =
-    [ initDriver 0
-        (initStraightRoad ( 2, 3 ) Right 6)
-        [ o03, o01, o01, o10, o10 ]
-    , initDriver 1 (initStraightRoad ( 7, 3 ) Down 6) []
-    ]
+
+-- Maybe Rename to TransitStage
+
+
+type DeliveryLeg
+    = Pickup
+    | Dropoff
 
 
 initDriver : Int -> Road -> List Order -> Driver
@@ -354,6 +567,11 @@ initDriver id road pendingOrders =
     , state = Idle
     , pendingOrders = pendingOrders
     }
+
+
+driverAssignOrder : Order -> Driver -> Driver
+driverAssignOrder o d =
+    { d | pendingOrders = d.pendingOrders ++ [ o ] }
 
 
 driverPathGPs : Driver -> List GP
@@ -367,18 +585,21 @@ driverEndpoints d =
 
 
 type DriverEvent
-    = PickedupOrder Order
-    | DeliveredOrder Order
+    = AtEndOf DeliveryLeg Order
 
 
-orderCurrentPickupNode : Order -> Node
-orderCurrentPickupNode o =
-    o.plan |> Pivot.getC |> .from
+driverHandoverComplete : Int -> Driver -> Driver
+driverHandoverComplete id d =
+    case d.state of
+        WaitingForHandover o ->
+            if id == o.id then
+                processPendingOrders { d | state = Idle }
 
+            else
+                Debug.todo "not WaitingForHandover"
 
-orderCurrentDeliveryNode : Order -> Node
-orderCurrentDeliveryNode o =
-    o.plan |> Pivot.getC |> .to
+        _ ->
+            Debug.todo "not WaitingForHandover"
 
 
 stepDriver : Driver -> ( Driver, Maybe DriverEvent )
@@ -387,54 +608,48 @@ stepDriver d =
         Idle ->
             ( processPendingOrders d, Nothing )
 
-        Pickingup o ->
-            let
-                node =
-                    orderCurrentPickupNode o
-
-                gp =
-                    nodeGP node
-            in
-            if Pivot.getC d.pos == gp then
-                ( { d | state = Delivering o }, Just (PickedupOrder o) )
-
-            else
-                ( moveDriver gp d, Just (PickedupOrder o) )
-
         WaitingForHandover _ ->
             ( d, Nothing )
 
-        Delivering o ->
-            let
-                node =
-                    orderCurrentDeliveryNode o
+        InTransitFor deliveryLeg o ->
+            moveDriverTowardsEndOfDeliveryLeg deliveryLeg o d
+                |> ME.withDefaultLazy
+                    (\_ ->
+                        ( case deliveryLeg of
+                            Pickup ->
+                                { d | state = InTransitFor Dropoff o }
 
-                gp =
-                    nodeGP node
-            in
-            if Pivot.getC d.pos == gp then
-                case node of
-                    BR _ ->
-                        ( processPendingOrders { d | state = Idle }, Just (DeliveredOrder o) )
+                            Dropoff ->
+                                case orderCurrentNodeForDeliveryLeg deliveryLeg o of
+                                    BR _ ->
+                                        processPendingOrders { d | state = Idle }
 
-                    DR _ ->
-                        ( { d | state = WaitingForHandover o }, Just (DeliveredOrder o) )
-
-            else
-                ( moveDriver gp d, Nothing )
+                                    DR _ ->
+                                        { d | state = WaitingForHandover o }
+                        , Just (AtEndOf deliveryLeg o)
+                        )
+                    )
 
 
 processPendingOrders d =
     case d.pendingOrders of
         o :: pendingOrders ->
-            { d | state = Pickingup o, pendingOrders = pendingOrders }
+            { d | state = InTransitFor Pickup o, pendingOrders = pendingOrders }
 
         [] ->
             d
 
 
-moveDriver gp d =
-    { d | pos = moveTowards gp d.pos }
+moveDriverTowardsEndOfDeliveryLeg deliveryLeg o d =
+    let
+        gp =
+            orderCurrentDestinationGPForDeliveryLeg deliveryLeg o
+    in
+    if Pivot.getC d.pos == gp then
+        Nothing
+
+    else
+        Just ( { d | pos = moveTowards gp d.pos }, Nothing )
 
 
 moveTowards gp pos =
@@ -445,7 +660,7 @@ moveTowards gp pos =
         moveTowards gp (Pivot.reverse pos)
 
     else
-        Debug.todo "impl"
+        Debug.todo ("invalid move pos." ++ Debug.toString ( gp, pos ))
 
 
 withRollback =
@@ -483,10 +698,10 @@ viewVehicle gp state =
                     Idle ->
                         Nothing
 
-                    Pickingup _ ->
+                    InTransitFor Pickup _ ->
                         Nothing
 
-                    Delivering o ->
+                    InTransitFor Dropoff o ->
                         Just o.resource
 
                     WaitingForHandover o ->
@@ -522,6 +737,36 @@ viewRoadEndpoint gp =
         ]
 
 
+
+-- DRIVERS
+
+
+type alias Drivers =
+    List Driver
+
+
+initialDrivers : Drivers
+initialDrivers =
+    [ initDriver 0 (initStraightRoad ( 2, 3 ) Right 6) []
+    , initDriver 1 (initStraightRoad ( 7, 3 ) Down 6) []
+    , initDriver 2 (initStraightRoad ( 7, 8 ) Left 6) []
+    ]
+
+
+driversAssignOrderTo : DriverId -> Order -> Drivers -> Drivers
+driversAssignOrderTo id order =
+    updateDriverById id (driverAssignOrder order)
+
+
+updateDriverById : DriverId -> (Driver -> Driver) -> Drivers -> Drivers
+updateDriverById driverId fn drivers =
+    updateExactlyOne (.id >> eq driverId) fn drivers
+
+
+
+-- RESOURCE
+
+
 type Resource
     = Water
     | Wood
@@ -536,14 +781,28 @@ resourceColor r =
             colorWood
 
 
+
+-- BUILDING
+
+
 type alias Building =
     { id : Int
     , resources : Int
+    , demands : List Demand
+    , stock : List StockItem
     , entry : GP
     , entryToCenterOffset : Float2
     , size : Int2
     , fill : String
     }
+
+
+type Demand
+    = Demand Int Resource (List OrderId)
+
+
+type StockItem
+    = StockItem Int Resource (List OrderId)
 
 
 type alias BuildingRef =
@@ -555,43 +814,27 @@ buildingToRef b =
 
 
 b0 =
-    { id = 0, resources = 5, entry = ( 2, 3 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWater }
+    { id = 0, resources = 5, demands = [], stock = [ StockItem 5 Water [] ], entry = ( 2, 3 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWater }
 
 
 b1 =
-    { id = 1, resources = 5, entry = ( 5, 3 ), entryToCenterOffset = ( 0, 2 ), size = ( 3, 3 ), fill = colorHQGray }
+    { id = 1, resources = 5, demands = [], stock = [], entry = ( 5, 3 ), entryToCenterOffset = ( 0, 2 ), size = ( 3, 3 ), fill = colorHQGray }
 
 
 b3 =
-    { id = 3, resources = 5, entry = ( 7, 6 ), entryToCenterOffset = ( 1.5, 0 ), size = ( 2, 3 ), fill = colorWood }
+    { id = 3, resources = 5, demands = [], stock = [], entry = ( 7, 6 ), entryToCenterOffset = ( 1.5, 0 ), size = ( 2, 3 ), fill = colorWood }
 
 
-initOrder from to resource =
-    { resource = resource, plan = Pivot.singleton (initBBStep from to) }
-
-
-o01 =
-    initOrder b0 b1 Water
-
-
-o10 =
-    initOrder b1 b0 Wood
-
-
-o03 =
-    { resource = Water
-    , plan =
-        Pivot.fromCons
-            { from = BR (buildingToRef b0), to = DR { id = 1, gp = ( 6, 3 ) } }
-            [ { from = DR { id = 0, gp = ( 7, 4 ) }, to = BR (buildingToRef b3) } ]
-    }
+b4 =
+    { id = 4, resources = 5, demands = [ Demand 5 Water [] ], stock = [], entry = ( 4, 8 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWood }
 
 
 initialBuildings =
     [ b0
     , b1
-    , { id = 2, resources = 5, entry = ( 6, 3 ), entryToCenterOffset = ( 0, -1.5 ), size = ( 3, 2 ), fill = colorWater }
+    , { id = 2, resources = 5, demands = [], stock = [], entry = ( 6, 3 ), entryToCenterOffset = ( 0, -1.5 ), size = ( 3, 2 ), fill = colorWater }
     , b3
+    , b4
     ]
 
 
@@ -624,7 +867,10 @@ viewBuilding b =
                 , strokeWidth strokeThickness
                 , SA.rx "5"
                 ]
-            , words (String.fromInt b.resources) [ fill strokeColor ]
+
+            -- , words (String.fromInt b.resources) [ fill strokeColor ]
+            , viewStock b.stock
+            , viewDemands b.demands
             ]
         , circleWithDiameter buildingEntryDiameter
             [ fill b.fill
@@ -633,6 +879,30 @@ viewBuilding b =
             , styleTranslate entryCenter
             ]
         ]
+
+
+viewStock stock =
+    let
+        viewStockItem (StockItem unassigned resource reservedOrderIds) =
+            let
+                ct =
+                    unassigned + List.length reservedOrderIds
+            in
+            words ("P " ++ Debug.toString resource ++ ": " ++ String.fromInt ct) [ fill strokeColor ]
+    in
+    group [ styleTranslate ( 0, -cellGap * 2 ) ] (List.map viewStockItem stock)
+
+
+viewDemands demands =
+    let
+        viewDemand (Demand unassigned resource reservedOrderIds) =
+            let
+                ct =
+                    unassigned + List.length reservedOrderIds
+            in
+            words ("C " ++ Debug.toString resource ++ ": " ++ String.fromInt ct) [ fill strokeColor ]
+    in
+    group [ styleTranslate ( 0, cellGap * 2 ) ] (List.map viewDemand demands)
 
 
 
