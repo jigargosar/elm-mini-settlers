@@ -90,19 +90,20 @@ createOrders model =
     -- [ o04, o03, o01, o01, o10, o10 ]
     -- [ o01, o01, o10, o10 ]
     let
-        requests : List Request
-        requests =
-            assembleRequests model
-
         foo : List (OrderId -> Order)
         foo =
             model
                 |> assembleRequests
                 |> assembleResourceContenders
                 |> List.concatMap createOrdersForResourceContenders
+
+        orders =
+            foo |> List.indexedMap (\i fn -> fn (i + 10))
     in
     if model.step == 1 then
-        [ o01 ]
+        -- [ o01 ]
+        orders
+            |> Debug.log "debug"
 
     else
         []
@@ -119,31 +120,65 @@ createOrdersForContender producer resource available { consumer, required, route
         toBeCreated =
             required |> atMost available
     in
-    ( available - toBeCreated, List.repeat toBeCreated (createOrder_ { producer = producer, resource = resource, consumer = consumer, route = route }) )
+    ( available - toBeCreated, List.repeat toBeCreated (createOrder { producer = producer, resource = resource, consumer = consumer, route = route }) )
 
 
-createOrder_ _ =
-    \_ -> o01
-
-
-createOrdersForStockItem : { producer : Building, stockItem : StockItem, route : NE Driver, consumer : Building, demand : Demand } -> ( StockItem, List Order )
-createOrdersForStockItem r =
+createOrder { producer, resource, consumer, route } orderId =
     let
-        (StockItem available resource _) =
-            r.stockItem
+        order : Order
+        order =
+            { id = orderId
+            , resource = resource
+            , initialDriverId = NE.head route |> .driver |> .id
+            , plan = plan
+            -- , plan = o01.plan
+            }
 
-        (Demand needed _ _) =
-            r.demand
+        ( from, to ) =
+            ( producer, consumer ) |> tmap buildingToRef
 
-        toBeCreated =
-            (available - needed)
-                |> atLeast 0
+        plan = 
+            case route of
+                ( _, [] ) ->
+                    SingleStep from to
+
+                ( firstRS, nextRS :: restRS ) ->
+                    let
+                        ( lastFromDriverRef, steps ) =
+                            createInbetweenSteps firstRS nextRS restRS []
+                    in
+                    MultiStep B2D
+                        { first = { from = from, to = createToHandoverRef firstRS nextRS }
+                        , steps = steps
+                        , last = { from = lastFromDriverRef, to = to }
+                        }
     in
-    ( StockItem (available - toBeCreated) resource [], times toBeCreated (createOrder r) )
+    order
 
 
-createOrder _ _ =
-    o01
+createInbetweenSteps prev current rest_ acc =
+    case rest_ of
+        [] ->
+            ( createFromHandoverRef prev current, List.reverse acc )
+
+        next :: rest ->
+            createInbetweenSteps current next rest (createStep prev current next :: acc)
+
+
+createStep p c n =
+    { from = createFromHandoverRef p c
+    , to = createToHandoverRef c n
+    }
+
+
+createToHandoverRef : RouteSegment -> RouteSegment -> DriverRef
+createToHandoverRef prev next =
+    { id = next.driver.id, gp = driverHandoverGPForEndPoint prev.dropGP prev.driver }
+
+
+createFromHandoverRef : RouteSegment -> RouteSegment -> DriverRef
+createFromHandoverRef prev next =
+    { id = prev.driver.id, gp = driverHandoverGPForEndPoint prev.dropGP next.driver }
 
 
 type alias ResourceContenders =
@@ -157,7 +192,7 @@ type alias ResourceContenders =
 type alias Contender =
     { consumer : Building
     , required : Int
-    , route : NE Driver
+    , route : Route
     }
 
 
@@ -199,7 +234,7 @@ assembleResourceContenders requests =
 type alias Request =
     { producer : Building
     , stockItem : StockItem
-    , route : NE Driver
+    , route : Route
     , consumer : Building
     , demand : Demand
     }
@@ -224,6 +259,7 @@ findShortestPathToProducer ((Demand _ resource _) as demand) consumer model =
         result =
             model.drivers
                 |> driversFindAllServicingGP consumer.entry
+                |> List.map (\d -> { driver = d, dropGP = consumer.entry })
                 |> List.map (initSearchState consumer resource model.buildings [])
                 |> Search.uniformCost { step = searchStateStep consumer resource model, cost = searchStateCost }
                 |> Search.nextGoal
@@ -237,8 +273,16 @@ findShortestPathToProducer ((Demand _ resource _) as demand) consumer model =
 
 
 type SearchState
-    = Ongoing (NE Driver)
-    | Found Building StockItem (NE Driver)
+    = Ongoing Route
+    | Found Building StockItem Route
+
+
+type alias Route =
+    NE RouteSegment
+
+
+type alias RouteSegment =
+    { driver : Driver, dropGP : GP }
 
 
 withGoalStatus state =
@@ -252,34 +296,39 @@ withGoalStatus state =
     )
 
 
-initSearchState : Building -> Resource -> Buildings -> List Driver -> Driver -> ( SearchState, Bool )
-initSearchState consumer resource buildings prevDrivers driver =
+initSearchState : Building -> Resource -> Buildings -> List RouteSegment -> RouteSegment -> ( SearchState, Bool )
+initSearchState consumer resource buildings prevRouteSegments routeSegment =
     LE.findMap
         (\b ->
-            if b.id /= consumer.id && driverServicesGP b.entry driver then
-                buildingStockItemForResource resource b |> Maybe.map (\stockItem -> Found b stockItem ( driver, prevDrivers ))
+            if b.id /= consumer.id && driverServicesGP b.entry routeSegment.driver then
+                buildingStockItemForResource resource b |> Maybe.map (\stockItem -> Found b stockItem ( routeSegment, prevRouteSegments ))
 
             else
                 Nothing
         )
         buildings
-        |> Maybe.withDefault (Ongoing ( driver, prevDrivers ))
+        |> Maybe.withDefault (Ongoing ( routeSegment, prevRouteSegments ))
         |> withGoalStatus
 
 
 searchStateStep : Building -> Resource -> Model -> SearchState -> List ( SearchState, Bool )
 searchStateStep consumer resource model state =
     case state of
-        Ongoing (( driver, rest ) as ned) ->
+        Ongoing (( routeSegment, restRouteSegments ) as route) ->
             model.drivers
-                |> List.filter (\d -> not (NE.member d ned) && driversConnected driver d)
-                |> List.map (initSearchState consumer resource model.buildings (driver :: rest))
+                |> List.concatMap
+                    (\d ->
+                        driversConnectedGPs d routeSegment.driver
+                            |> List.map (\gp -> { driver = d, dropGP = gp })
+                            |> List.filter (\rs -> not (NE.member rs route))
+                    )
+                |> List.map (initSearchState consumer resource model.buildings (routeSegment :: restRouteSegments))
 
         Found _ _ _ ->
             []
 
 
-searchStateRoute : SearchState -> NE Driver
+searchStateRoute : SearchState -> Route
 searchStateRoute state =
     case state of
         Ongoing route ->
@@ -767,8 +816,8 @@ initDriver id road pendingOrders =
     }
 
 
-driversConnected : Driver -> Driver -> Bool
-driversConnected a b =
+driversConnectedGPs : Driver -> Driver -> List GP
+driversConnectedGPs a b =
     let
         ( e1, e2 ) =
             a.endpoints
@@ -776,7 +825,28 @@ driversConnected a b =
         ( e3, e4 ) =
             b.endpoints
     in
-    e1 == e3 || e1 == e4 || e2 == e3 || e2 == e4
+    -- e1 == e3 || e1 == e4 || e2 == e3 || e2 == e4
+    [ e1, e2 ] |> List.filter (\gp -> gp == e3 || gp == e4)
+
+
+driverHandoverGPForEndPoint : GP -> Driver -> GP
+driverHandoverGPForEndPoint ep d =
+    let
+        fn ls =
+            case ls of
+                f :: s :: _ ->
+                    if f == ep then
+                        Just s
+
+                    else
+                        Nothing
+
+                _ ->
+                    Nothing
+    in
+    Pivot.toList d.pos
+        |> ME.oneOf [ fn, List.reverse >> fn ]
+        |> ME.withDefaultLazy (\_ -> Debug.todo "handover for gp not found")
 
 
 driverServicesGP : GP -> Driver -> Bool
