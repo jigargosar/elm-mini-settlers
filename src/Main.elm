@@ -9,6 +9,7 @@ import List.Extra as LE
 import List.Nonempty as NE
 import Maybe.Extra as ME
 import Pivot exposing (Pivot)
+import Search
 import Svg exposing (Svg)
 import Svg.Attributes as SA
 import Time
@@ -26,7 +27,7 @@ main =
 
 type alias Model =
     { drivers : Drivers
-    , buildings : List Building
+    , buildings : Buildings
     , step : Int
     }
 
@@ -70,15 +71,6 @@ update msg model =
 
 
 updateOnTick model =
-    -- let
-    --     ( drivers, events ) =
-    --         List.map stepDriver model.drivers
-    --             |> List.unzip
-    --             |> Tuple.mapSecond (List.filterMap identity)
-    --     ( drivers2, buildings ) =
-    --         List.foldl processDriverEvent ( drivers, model.buildings ) events
-    -- in
-    -- { model | drivers = drivers2, buildings = buildings, step = model.step + 1 }
     model
         |> incStepCount
         |> createAndAssignOrders
@@ -89,6 +81,228 @@ incStepCount model =
     { model | step = model.step + 1 }
 
 
+createAndAssignOrders model =
+    createOrders model
+        |> List.foldl assignOrder model
+
+
+createOrders model =
+    -- [ o04, o03, o01, o01, o10, o10 ]
+    -- [ o01, o01, o10, o10 ]
+    let
+        requests : List Request
+        requests =
+            assembleRequests model
+
+        foo : List (OrderId -> Order)
+        foo =
+            model
+                |> assembleRequests
+                |> assembleResourceContenders
+                |> List.concatMap createOrdersForResourceContenders
+    in
+    if model.step == 1 then
+        [ o01 ]
+
+    else
+        []
+
+
+createOrdersForResourceContenders : ResourceContenders -> List (OrderId -> Order)
+createOrdersForResourceContenders { producer, resource, available, contenders } =
+    contenders |> LE.mapAccuml (createOrdersForContender producer resource) available |> Tuple.second |> List.concat
+
+
+createOrdersForContender : Building -> Resource -> Int -> Contender -> ( Int, List (OrderId -> Order) )
+createOrdersForContender producer resource available { consumer, required, route } =
+    let
+        toBeCreated =
+            required |> atMost available
+    in
+    ( available - toBeCreated, List.repeat toBeCreated (createOrder_ { producer = producer, resource = resource, consumer = consumer, route = route }) )
+
+
+createOrder_ _ =
+    \_ -> o01
+
+
+createOrdersForStockItem : { producer : Building, stockItem : StockItem, route : NE Driver, consumer : Building, demand : Demand } -> ( StockItem, List Order )
+createOrdersForStockItem r =
+    let
+        (StockItem available resource _) =
+            r.stockItem
+
+        (Demand needed _ _) =
+            r.demand
+
+        toBeCreated =
+            (available - needed)
+                |> atLeast 0
+    in
+    ( StockItem (available - toBeCreated) resource [], times toBeCreated (createOrder r) )
+
+
+createOrder _ _ =
+    o01
+
+
+type alias ResourceContenders =
+    { resource : Resource
+    , producer : Building
+    , available : Int
+    , contenders : List Contender
+    }
+
+
+type alias Contender =
+    { consumer : Building
+    , required : Int
+    , route : NE Driver
+    }
+
+
+assembleResourceContenders : List Request -> List ResourceContenders
+assembleResourceContenders requests =
+    requests
+        |> LE.gatherEqualsBy .producer
+        |> List.concatMap
+            (NE.toList
+                >> LE.gatherEqualsBy .stockItem
+                >> List.map
+                    (\( h, t ) ->
+                        let
+                            (StockItem available resource _) =
+                                h.stockItem
+
+                            producer =
+                                h.producer
+                        in
+                        { producer = producer
+                        , available = available
+                        , resource = resource
+                        , contenders =
+                            (h :: t)
+                                |> List.sortBy (.route >> NE.length)
+                                |> List.map
+                                    (\{ consumer, route, demand } ->
+                                        let
+                                            (Demand required _ _) =
+                                                demand
+                                        in
+                                        { consumer = consumer, required = required, route = route }
+                                    )
+                        }
+                    )
+            )
+
+
+type alias Request =
+    { producer : Building
+    , stockItem : StockItem
+    , route : NE Driver
+    , consumer : Building
+    , demand : Demand
+    }
+
+
+assembleRequests : Model -> List Request
+assembleRequests model =
+    model.buildings
+        |> List.concatMap
+            (\consumer ->
+                consumer.demands
+                    |> List.filterMap
+                        (\demand ->
+                            findShortestPathToProducer demand consumer model
+                        )
+            )
+
+
+findShortestPathToProducer : Demand -> Building -> Model -> Maybe Request
+findShortestPathToProducer ((Demand _ resource _) as demand) consumer model =
+    let
+        result =
+            model.drivers
+                |> driversFindAllServicingGP consumer.entry
+                |> List.map (initSearchState consumer resource model.buildings [])
+                |> Search.uniformCost { step = searchStateStep consumer resource model, cost = searchStateCost }
+                |> Search.nextGoal
+    in
+    case result of
+        Search.Goal (Found producer stockItem route) _ ->
+            Just { producer = producer, stockItem = stockItem, route = route, consumer = consumer, demand = demand }
+
+        _ ->
+            Nothing
+
+
+type SearchState
+    = Ongoing (NE Driver)
+    | Found Building StockItem (NE Driver)
+
+
+withGoalStatus state =
+    ( state
+    , case state of
+        Ongoing _ ->
+            False
+
+        Found _ _ _ ->
+            True
+    )
+
+
+initSearchState : Building -> Resource -> Buildings -> List Driver -> Driver -> ( SearchState, Bool )
+initSearchState consumer resource buildings prevDrivers driver =
+    LE.findMap
+        (\b ->
+            if b.id /= consumer.id && driverServicesGP b.entry driver then
+                buildingStockItemForResource resource b |> Maybe.map (\stockItem -> Found b stockItem ( driver, prevDrivers ))
+
+            else
+                Nothing
+        )
+        buildings
+        |> Maybe.withDefault (Ongoing ( driver, prevDrivers ))
+        |> withGoalStatus
+
+
+searchStateStep : Building -> Resource -> Model -> SearchState -> List ( SearchState, Bool )
+searchStateStep consumer resource model state =
+    case state of
+        Ongoing (( driver, rest ) as ned) ->
+            model.drivers
+                |> List.filter (\d -> not (NE.member d ned) && driversConnected driver d)
+                |> List.map (initSearchState consumer resource model.buildings (driver :: rest))
+
+        Found _ _ _ ->
+            []
+
+
+searchStateRoute : SearchState -> NE Driver
+searchStateRoute state =
+    case state of
+        Ongoing route ->
+            route
+
+        Found _ _ route ->
+            route
+
+
+searchStateCost : SearchState -> Float
+searchStateCost state =
+    searchStateRoute state |> NE.length |> toFloat
+
+
+assignOrder : Order -> Model -> Model
+assignOrder order model =
+    -- assign orders to buildings and drivers
+    { model
+        | drivers = driversAssignOrderTo order.initialDriverId order model.drivers
+        , buildings = model.buildings |> buildingsReserveStockForOrder order
+    }
+
+
 stepDrivers model =
     let
         ( drivers, events ) =
@@ -97,35 +311,6 @@ stepDrivers model =
                 |> Tuple.mapSecond (List.filterMap identity)
     in
     { model | drivers = drivers } |> processDriverEvents events
-
-
-createAndAssignOrders model =
-    -- assign orders to buildings and drivers
-    let
-        newOrders : List Order
-        newOrders =
-            createOrders model
-    in
-    model |> assignOrders newOrders
-
-
-createOrders model =
-    -- [ o04, o03, o01, o01, o10, o10 ]
-    -- [ o01, o01, o10, o10 ]
-    if model.step == 1 then
-        [ o01 ]
-
-    else
-        []
-
-
-assignOrders orders model =
-    List.foldl assignOrder model orders
-
-
-assignOrder : Order -> Model -> Model
-assignOrder order model =
-    { model | drivers = driversAssignOrderTo order.initialDriverId order model.drivers }
 
 
 processDriverEvents events model =
@@ -154,7 +339,7 @@ processDriverEvent e ( drivers, buildings ) =
                             p.first.to.id
                     in
                     ( drivers
-                        |> updateDriverById nextDriverId (\d -> { d | pendingOrders = d.pendingOrders ++ [ updatedOrder ] })
+                        |> driversAssignOrderTo nextDriverId updatedOrder
                     , buildings
                     )
 
@@ -172,9 +357,12 @@ processDriverEvent e ( drivers, buildings ) =
                             step.to.id
                     in
                     ( drivers
-                        |> updateDriverById nextDriverId (driverAssignOrder updatedOrder)
+                        |> driversAssignOrderTo nextDriverId updatedOrder
                     , buildings
                     )
+
+                ( Pickup, SingleStep from _ ) ->
+                    ( drivers, buildings |> buildingsUpdateOnOrderPickup o )
 
                 ( Pickup, MultiStep D2B p ) ->
                     let
@@ -182,7 +370,7 @@ processDriverEvent e ( drivers, buildings ) =
                             p.last.from.id
                     in
                     ( drivers
-                        |> updateDriverById prevDriverId (\d -> driverHandoverComplete o.id d)
+                        |> driversNotifyHandoverCompletedTo prevDriverId o.id
                     , buildings
                     )
 
@@ -192,7 +380,7 @@ processDriverEvent e ( drivers, buildings ) =
                             step.from.id
                     in
                     ( drivers
-                        |> updateDriverById prevDriverId (\d -> driverHandoverComplete o.id d)
+                        |> driversNotifyHandoverCompletedTo prevDriverId o.id
                     , buildings
                     )
 
@@ -450,6 +638,16 @@ orderCurrentNodeForDeliveryLeg deliveryLeg o =
             orderCurrentDeliveryNode o
 
 
+orderPickupBuildingId : Order -> BuildingId
+orderPickupBuildingId o =
+    case o.plan of
+        SingleStep { id } _ ->
+            id
+
+        MultiStep _ p ->
+            p.first.from.id
+
+
 orderCurrentPickupNode : Order -> Node
 orderCurrentPickupNode o =
     case o.plan of
@@ -569,6 +767,23 @@ initDriver id road pendingOrders =
     }
 
 
+driversConnected : Driver -> Driver -> Bool
+driversConnected a b =
+    let
+        ( e1, e2 ) =
+            a.endpoints
+
+        ( e3, e4 ) =
+            b.endpoints
+    in
+    e1 == e3 || e1 == e4 || e2 == e3 || e2 == e4
+
+
+driverServicesGP : GP -> Driver -> Bool
+driverServicesGP gp d =
+    d.pos |> Pivot.toList |> List.member gp
+
+
 driverAssignOrder : Order -> Driver -> Driver
 driverAssignOrder o d =
     { d | pendingOrders = d.pendingOrders ++ [ o ] }
@@ -588,8 +803,8 @@ type DriverEvent
     = AtEndOf DeliveryLeg Order
 
 
-driverHandoverComplete : Int -> Driver -> Driver
-driverHandoverComplete id d =
+driverNotifyHandoverCompleted : Int -> Driver -> Driver
+driverNotifyHandoverCompleted id d =
     case d.state of
         WaitingForHandover o ->
             if id == o.id then
@@ -753,13 +968,23 @@ initialDrivers =
     ]
 
 
+driversFindAllServicingGP : GP -> Drivers -> Drivers
+driversFindAllServicingGP gp =
+    List.filter (driverServicesGP gp)
+
+
 driversAssignOrderTo : DriverId -> Order -> Drivers -> Drivers
 driversAssignOrderTo id order =
-    updateDriverById id (driverAssignOrder order)
+    updateDriverWithId id (driverAssignOrder order)
 
 
-updateDriverById : DriverId -> (Driver -> Driver) -> Drivers -> Drivers
-updateDriverById driverId fn drivers =
+driversNotifyHandoverCompletedTo : DriverId -> OrderId -> Drivers -> Drivers
+driversNotifyHandoverCompletedTo driverId orderId =
+    updateDriverWithId driverId (driverNotifyHandoverCompleted orderId)
+
+
+updateDriverWithId : DriverId -> (Driver -> Driver) -> Drivers -> Drivers
+updateDriverWithId driverId fn drivers =
     updateExactlyOne (.id >> eq driverId) fn drivers
 
 
@@ -785,6 +1010,10 @@ resourceColor r =
 -- BUILDING
 
 
+type alias BuildingId =
+    Int
+
+
 type alias Building =
     { id : Int
     , resources : Int
@@ -807,6 +1036,36 @@ type StockItem
 
 type alias BuildingRef =
     { id : Int, gp : GP }
+
+
+buildingStockItemForResource : Resource -> Building -> Maybe StockItem
+buildingStockItemForResource resource_ b =
+    LE.find (\((StockItem _ resource _) as stockItem) -> resource == resource_) b.stock
+
+
+buildingReserveStockForOrder : Order -> Building -> Building
+buildingReserveStockForOrder o b =
+    let
+        stock =
+            updateExactlyOne (\(StockItem unassigned resource _) -> resource == o.resource && unassigned > 0)
+                (\(StockItem unassigned resource reservedOrderIds) ->
+                    StockItem (unassigned - 1) resource (o.id :: reservedOrderIds)
+                )
+                b.stock
+    in
+    { b | stock = stock }
+
+
+buildingUpdateOnOrderPickup orderId b =
+    let
+        stock =
+            updateExactlyOne (\(StockItem _ _ reservedOrderIds) -> List.member orderId reservedOrderIds)
+                (\(StockItem unassigned resource reservedOrderIds) ->
+                    StockItem unassigned resource (LE.remove orderId reservedOrderIds)
+                )
+                b.stock
+    in
+    { b | stock = stock }
 
 
 buildingToRef b =
@@ -836,10 +1095,6 @@ initialBuildings =
     , b3
     , b4
     ]
-
-
-buildingIdEq id b =
-    eq id b.id
 
 
 viewBuilding : Building -> Svg msg
@@ -903,6 +1158,29 @@ viewDemands demands =
             words ("C " ++ Debug.toString resource ++ ": " ++ String.fromInt ct) [ fill strokeColor ]
     in
     group [ styleTranslate ( 0, cellGap * 2 ) ] (List.map viewDemand demands)
+
+
+
+-- BUILDINGS
+
+
+type alias Buildings =
+    List Building
+
+
+buildingsUpdateOnOrderPickup : Order -> Buildings -> Buildings
+buildingsUpdateOnOrderPickup order =
+    updateBuildingWithId (orderPickupBuildingId order) (buildingUpdateOnOrderPickup order.id)
+
+
+buildingsReserveStockForOrder : Order -> Buildings -> Buildings
+buildingsReserveStockForOrder order =
+    updateBuildingWithId (orderPickupBuildingId order) (buildingReserveStockForOrder order)
+
+
+updateBuildingWithId : BuildingId -> (Building -> Building) -> Buildings -> Buildings
+updateBuildingWithId buildingId fn =
+    updateExactlyOne (.id >> eq buildingId) fn
 
 
 
@@ -989,6 +1267,14 @@ polyline pts attrs =
 
 
 -- BASICS
+
+
+atLeast =
+    max
+
+
+atMost =
+    min
 
 
 eq =
