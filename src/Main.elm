@@ -70,43 +70,51 @@ update msg model =
             )
 
 
-updateOnTick model =
-    model
-        |> incStepCount
-        |> createAndAssignOrders
-        |> stepDrivers
+updateOnTick : Model -> Model
+updateOnTick =
+    (\model -> { model | step = model.step + 1 })
+        >> (\model ->
+                let
+                    orders =
+                        createOrders model
 
-
-incStepCount model =
-    { model | step = model.step + 1 }
-
-
-createAndAssignOrders model =
-    createOrders model
-        |> List.foldl assignOrder model
+                    ( drivers, buildings ) =
+                        assignOrders model.drivers model.buildings orders
+                in
+                { model | drivers = drivers, buildings = buildings }
+           )
+        >> (\model ->
+                let
+                    ( drivers, events ) =
+                        driversStep model.drivers
+                in
+                ( events, { model | drivers = drivers } )
+           )
+        >> (\( events, model ) ->
+                let
+                    ( drivers, buildings ) =
+                        processDriverEvents model.drivers model.buildings events
+                in
+                { model | drivers = drivers, buildings = buildings }
+           )
 
 
 createOrders model =
-    -- [ o04, o03, o01, o01, o10, o10 ]
-    -- [ o01, o01, o10, o10 ]
     let
-        foo : List (OrderId -> Order)
-        foo =
+        orderCtors : List (OrderId -> Order)
+        orderCtors =
             model
                 |> assembleRequests
                 |> assembleResourceContenders
                 |> List.concatMap createOrdersForResourceContenders
 
-        orders =
-            foo |> List.indexedMap (\i fn -> fn (i + 10))
-    in
-    if model.step == 1 then
-        -- [ o01 ]
-        orders
-            |> Debug.log "debug"
+        nextOrderId =
+            99
 
-    else
-        []
+        orders =
+            orderCtors |> List.indexedMap (\i fn -> fn (i + nextOrderId))
+    in
+    orders
 
 
 createOrdersForResourceContenders : ResourceContenders -> List (OrderId -> Order)
@@ -130,28 +138,28 @@ createOrder { producer, resource, consumer, route } orderId =
             { id = orderId
             , resource = resource
             , initialDriverId = NE.head route |> .driver |> .id
-            , plan = plan
-            -- , plan = o01.plan
+            , from = from
+            , to = to
+            , steps = steps
             }
 
-        ( from, to ) =
-            ( producer, consumer ) |> tmap buildingToRef
-
-        plan = 
+        steps =
             case route of
                 ( _, [] ) ->
-                    SingleStep from to
+                    Pivot.fromCons { from = BR from, to = BR to } []
 
                 ( firstRS, nextRS :: restRS ) ->
                     let
-                        ( lastFromDriverRef, steps ) =
+                        ( lastFromDriverRef, steps_ ) =
                             createInbetweenSteps firstRS nextRS restRS []
                     in
-                    MultiStep B2D
-                        { first = { from = from, to = createToHandoverRef firstRS nextRS }
-                        , steps = steps
-                        , last = { from = lastFromDriverRef, to = to }
-                        }
+                    Pivot.fromCons { from = BR from, to = DR <| createToHandoverRef firstRS nextRS }
+                        (List.map (\s -> { from = DR s.from, to = DR s.to }) steps_
+                            ++ [ { from = DR lastFromDriverRef, to = BR to } ]
+                        )
+
+        ( from, to ) =
+            ( producer, consumer ) |> tmap buildingToRef
     in
     order
 
@@ -343,98 +351,79 @@ searchStateCost state =
     searchStateRoute state |> NE.length |> toFloat
 
 
-assignOrder : Order -> Model -> Model
-assignOrder order model =
-    -- assign orders to buildings and drivers
-    { model
-        | drivers = driversAssignOrderTo order.initialDriverId order model.drivers
-        , buildings = model.buildings |> buildingsReserveStockForOrder order
-    }
+assignOrders : Drivers -> Buildings -> List Order -> ( Drivers, Buildings )
+assignOrders drivers buildings orders =
+    List.foldl assignOrder ( drivers, buildings ) orders
 
 
-stepDrivers model =
+assignOrder : Order -> ( Drivers, Buildings ) -> ( Drivers, Buildings )
+assignOrder order ( drivers, buildings ) =
+    ( driversAssignOrderTo order.initialDriverId order drivers
+    , buildings
+        |> updateBuildingWithId order.from.id (buildingReserveStockForOrder order)
+        |> updateBuildingWithId order.to.id (buildingRegisterOrderWithDemand order)
+    )
+
+
+driversStep : Drivers -> ( Drivers, List DriverEvent )
+driversStep drivers =
+    List.map stepDriver drivers
+        |> List.unzip
+        |> Tuple.mapSecond (List.filterMap identity)
+
+
+processDriverEvents drivers buildings events =
+    List.foldl processDriverEvent ( drivers, buildings ) events
+
+
+
+-- processDriverEvents events model =
+--     let
+--         ( drivers, buildings ) =
+--             List.foldl processDriverEvent ( model.drivers, model.buildings ) events
+--     in
+--     { model | drivers = drivers, buildings = buildings }
+
+
+processDriverEvent (AtEndOf deliveryLeg o) ( drivers, buildings ) =
     let
-        ( drivers, events ) =
-            List.map stepDriver model.drivers
-                |> List.unzip
-                |> Tuple.mapSecond (List.filterMap identity)
+        node =
+            orderCurrentNodeForDeliveryLeg deliveryLeg o
     in
-    { model | drivers = drivers } |> processDriverEvents events
+    case deliveryLeg of
+        Pickup ->
+            case node of
+                BR br ->
+                    ( drivers
+                    , buildings |> updateBuildingWithId br.id (buildingUpdateOnOrderPickup o.id)
+                    )
+
+                DR dr ->
+                    ( drivers |> driversNotifyHandoverCompletedTo dr.id o.id
+                    , buildings
+                    )
+
+        Dropoff ->
+            case node of
+                BR br ->
+                    ( drivers, buildings |> updateBuildingWithId br.id (buildingUpdateOnOrderDropoff o.id) )
+
+                DR dr ->
+                    ( drivers |> driversAssignOrderTo dr.id (orderUpdateNextStep o)
+                    , buildings
+                    )
 
 
-processDriverEvents events model =
+orderUpdateNextStep o =
     let
-        ( drivers, buildings ) =
-            List.foldl processDriverEvent ( model.drivers, model.buildings ) events
+        steps =
+            Pivot.goR o.steps
+                |> ME.withDefaultLazy (\_ -> Debug.todo "unable to handoff no next step")
+
+        updatedOrder =
+            { o | steps = steps }
     in
-    { model | drivers = drivers, buildings = buildings }
-
-
-processDriverEvent e ( drivers, buildings ) =
-    case e of
-        AtEndOf deliveryLeg o ->
-            case ( deliveryLeg, o.plan ) of
-                ( Dropoff, MultiStep B2D p ) ->
-                    let
-                        updatedOrder =
-                            case p.steps of
-                                [] ->
-                                    { o | plan = MultiStep D2B p }
-
-                                h :: t ->
-                                    { o | plan = MultiStep (D2D ( h, t )) p }
-
-                        nextDriverId =
-                            p.first.to.id
-                    in
-                    ( drivers
-                        |> driversAssignOrderTo nextDriverId updatedOrder
-                    , buildings
-                    )
-
-                ( Dropoff, MultiStep (D2D ( step, pendingSteps )) p ) ->
-                    let
-                        updatedOrder =
-                            case pendingSteps of
-                                [] ->
-                                    { o | plan = MultiStep D2B p }
-
-                                h :: t ->
-                                    { o | plan = MultiStep (D2D ( h, t )) p }
-
-                        nextDriverId =
-                            step.to.id
-                    in
-                    ( drivers
-                        |> driversAssignOrderTo nextDriverId updatedOrder
-                    , buildings
-                    )
-
-                ( Pickup, SingleStep from _ ) ->
-                    ( drivers, buildings |> buildingsUpdateOnOrderPickup o )
-
-                ( Pickup, MultiStep D2B p ) ->
-                    let
-                        prevDriverId =
-                            p.last.from.id
-                    in
-                    ( drivers
-                        |> driversNotifyHandoverCompletedTo prevDriverId o.id
-                    , buildings
-                    )
-
-                ( Pickup, MultiStep (D2D ( step, _ )) p ) ->
-                    let
-                        prevDriverId =
-                            step.from.id
-                    in
-                    ( drivers
-                        |> driversNotifyHandoverCompletedTo prevDriverId o.id
-                    , buildings
-                    )
-
-                _ ->
-                    ( drivers, buildings )
+    updatedOrder
 
 
 updateExactlyOne pred fn list =
@@ -628,30 +617,14 @@ type alias Order =
     { id : OrderId
     , resource : Resource
     , initialDriverId : DriverId
-    , plan : Plan
+    , from : BuildingRef
+    , to : BuildingRef
+    , steps : Pivot Step
     }
 
 
-type Plan
-    = SingleStep BuildingRef BuildingRef
-    | MultiStep CurrentStep MultiStepPlan
-
-
-initSingleStepPlan a b =
-    SingleStep (buildingToRef a) (buildingToRef b)
-
-
-type alias MultiStepPlan =
-    { first : { from : BuildingRef, to : DriverRef }
-    , steps : List { from : DriverRef, to : DriverRef }
-    , last : { from : DriverRef, to : BuildingRef }
-    }
-
-
-type CurrentStep
-    = B2D
-    | D2D (NE { from : DriverRef, to : DriverRef })
-    | D2B
+type alias Step =
+    { from : Node, to : Node }
 
 
 type Node
@@ -659,8 +632,9 @@ type Node
     | DR DriverRef
 
 
-initBuildingNode =
-    buildingToRef >> BR
+orderCurrentDestinationGPForDeliveryLeg : DeliveryLeg -> Order -> GP
+orderCurrentDestinationGPForDeliveryLeg deliveryLeg o =
+    orderCurrentNodeForDeliveryLeg deliveryLeg o |> nodeGP
 
 
 nodeGP n =
@@ -672,102 +646,18 @@ nodeGP n =
             gp
 
 
-orderCurrentDestinationGPForDeliveryLeg : DeliveryLeg -> Order -> GP
-orderCurrentDestinationGPForDeliveryLeg deliveryLeg o =
-    orderCurrentNodeForDeliveryLeg deliveryLeg o |> nodeGP
-
-
 orderCurrentNodeForDeliveryLeg : DeliveryLeg -> Order -> Node
 orderCurrentNodeForDeliveryLeg deliveryLeg o =
+    let
+        step =
+            o.steps |> Pivot.getC
+    in
     case deliveryLeg of
         Pickup ->
-            orderCurrentPickupNode o
+            step.from
 
         Dropoff ->
-            orderCurrentDeliveryNode o
-
-
-orderPickupBuildingId : Order -> BuildingId
-orderPickupBuildingId o =
-    case o.plan of
-        SingleStep { id } _ ->
-            id
-
-        MultiStep _ p ->
-            p.first.from.id
-
-
-orderCurrentPickupNode : Order -> Node
-orderCurrentPickupNode o =
-    case o.plan of
-        SingleStep br _ ->
-            BR br
-
-        MultiStep B2D p ->
-            BR p.first.from
-
-        MultiStep D2B p ->
-            DR p.last.from
-
-        MultiStep (D2D ( h, _ )) p ->
-            DR h.from
-
-
-orderCurrentDeliveryNode : Order -> Node
-orderCurrentDeliveryNode o =
-    case o.plan of
-        SingleStep _ br ->
-            BR br
-
-        MultiStep B2D p ->
-            DR p.first.to
-
-        MultiStep D2B p ->
-            BR p.last.to
-
-        MultiStep (D2D ( h, _ )) p ->
-            DR h.to
-
-
-initOrder : OrderId -> Building -> Building -> Resource -> Order
-initOrder id from to resource =
-    { id = id, initialDriverId = 0, resource = resource, plan = initSingleStepPlan from to }
-
-
-o01 =
-    initOrder 0 b0 b1 Water
-
-
-o10 =
-    initOrder 1 b1 b0 Wood
-
-
-o03 : Order
-o03 =
-    { id = 2
-    , resource = Water
-    , initialDriverId = 0
-    , plan =
-        MultiStep B2D
-            { first = { from = buildingToRef b0, to = { id = 1, gp = ( 6, 3 ) } }
-            , steps = []
-            , last = { from = { id = 0, gp = ( 7, 4 ) }, to = buildingToRef b3 }
-            }
-    }
-
-
-o04 : Order
-o04 =
-    { id = 3
-    , resource = Water
-    , initialDriverId = 0
-    , plan =
-        MultiStep B2D
-            { first = { from = buildingToRef b0, to = { id = 1, gp = ( 6, 3 ) } }
-            , steps = [ { from = { id = 0, gp = ( 7, 4 ) }, to = { id = 2, gp = ( 7, 7 ) } } ]
-            , last = { from = { id = 1, gp = ( 6, 8 ) }, to = buildingToRef b4 }
-            }
-    }
+            step.to
 
 
 
@@ -1113,6 +1003,32 @@ buildingStockItemForResource resource_ b =
     LE.find (\((StockItem _ resource _) as stockItem) -> resource == resource_) b.stock
 
 
+buildingRegisterOrderWithDemand : Order -> Building -> Building
+buildingRegisterOrderWithDemand o b =
+    let
+        demands =
+            updateExactlyOne (\(Demand unmet resource _) -> resource == o.resource && unmet > 0)
+                (\(Demand unmet resource registeredOrderIds) ->
+                    Demand (unmet - 1) resource (o.id :: registeredOrderIds)
+                )
+                b.demands
+    in
+    { b | demands = demands }
+
+
+buildingUpdateOnOrderDropoff : OrderId -> Building -> Building
+buildingUpdateOnOrderDropoff orderId b =
+    let
+        demands =
+            updateExactlyOne (\(Demand _ _ registeredOrderIds) -> List.member orderId registeredOrderIds)
+                (\(Demand unmet resource registeredOrderIds) ->
+                    Demand unmet resource (LE.remove orderId registeredOrderIds)
+                )
+                b.demands
+    in
+    { b | demands = demands }
+
+
 buildingReserveStockForOrder : Order -> Building -> Building
 buildingReserveStockForOrder o b =
     let
@@ -1236,16 +1152,6 @@ viewDemands demands =
 
 type alias Buildings =
     List Building
-
-
-buildingsUpdateOnOrderPickup : Order -> Buildings -> Buildings
-buildingsUpdateOnOrderPickup order =
-    updateBuildingWithId (orderPickupBuildingId order) (buildingUpdateOnOrderPickup order.id)
-
-
-buildingsReserveStockForOrder : Order -> Buildings -> Buildings
-buildingsReserveStockForOrder order =
-    updateBuildingWithId (orderPickupBuildingId order) (buildingReserveStockForOrder order)
 
 
 updateBuildingWithId : BuildingId -> (Building -> Building) -> Buildings -> Buildings
