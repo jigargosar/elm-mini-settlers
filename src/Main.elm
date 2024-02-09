@@ -43,14 +43,6 @@ init () =
     )
 
 
-applyN n fn a =
-    if n <= 0 then
-        a
-
-    else
-        applyN (n - 1) fn (fn a)
-
-
 type Msg
     = Tick
 
@@ -129,20 +121,20 @@ createOrders model =
 
 
 createOrdersForResourceContenders : ResourceContenders -> List (OrderId -> Order)
-createOrdersForResourceContenders { producer, resource, available, contenders } =
-    contenders |> LE.mapAccuml (createOrdersForContender producer resource) available |> Tuple.second |> List.concat
+createOrdersForResourceContenders { supplier, resource, available, contenders } =
+    contenders |> LE.mapAccuml (createOrdersForContender supplier resource) available |> Tuple.second |> List.concat
 
 
 createOrdersForContender : Building -> Resource -> Int -> Contender -> ( Int, List (OrderId -> Order) )
-createOrdersForContender producer resource available { consumer, required, route } =
+createOrdersForContender supplier resource available { consumer, required, route } =
     let
         toBeCreated =
             required |> atMost available
     in
-    ( available - toBeCreated, List.repeat toBeCreated (createOrder { producer = producer, resource = resource, consumer = consumer, route = route }) )
+    ( available - toBeCreated, List.repeat toBeCreated (createOrder { supplier = supplier, resource = resource, consumer = consumer, route = route }) )
 
 
-createOrder { producer, resource, consumer, route } orderId =
+createOrder { supplier, resource, consumer, route } orderId =
     let
         order : Order
         order =
@@ -170,7 +162,7 @@ createOrder { producer, resource, consumer, route } orderId =
                         )
 
         ( from, to ) =
-            ( producer, consumer ) |> tmap buildingToRef
+            ( supplier, consumer ) |> tmap buildingToRef
     in
     order
 
@@ -202,7 +194,7 @@ createFromHandoverRef prev next =
 
 type alias ResourceContenders =
     { resource : Resource
-    , producer : Building
+    , supplier : Building
     , available : Int
     , contenders : List Contender
     }
@@ -218,7 +210,7 @@ type alias Contender =
 assembleResourceContenders : List Request -> List ResourceContenders
 assembleResourceContenders requests =
     requests
-        |> LE.gatherEqualsBy .producer
+        |> LE.gatherEqualsBy .supplier
         |> List.concatMap
             (NE.toList
                 >> LE.gatherEqualsBy .stockItem
@@ -228,10 +220,10 @@ assembleResourceContenders requests =
                             (StockItem available resource _) =
                                 h.stockItem
 
-                            producer =
-                                h.producer
+                            supplier =
+                                h.supplier
                         in
-                        { producer = producer
+                        { supplier = supplier
                         , available = available
                         , resource = resource
                         , contenders =
@@ -251,7 +243,7 @@ assembleResourceContenders requests =
 
 
 type alias Request =
-    { producer : Building
+    { supplier : Building
     , stockItem : StockItem
     , route : Route
     , consumer : Building
@@ -267,13 +259,13 @@ assembleRequests model =
                 consumer.demands
                     |> List.filterMap
                         (\demand ->
-                            findShortestPathToProducer demand consumer model
+                            findShortestPathToSupplier demand consumer model
                         )
             )
 
 
-findShortestPathToProducer : Demand -> Building -> Model -> Maybe Request
-findShortestPathToProducer ((Demand _ resource _) as demand) consumer model =
+findShortestPathToSupplier : Demand -> Building -> Model -> Maybe Request
+findShortestPathToSupplier ((Demand _ resource _) as demand) consumer model =
     let
         result =
             model.drivers
@@ -284,8 +276,8 @@ findShortestPathToProducer ((Demand _ resource _) as demand) consumer model =
                 |> Search.nextGoal
     in
     case result of
-        Search.Goal (Found producer stockItem route) _ ->
-            Just { producer = producer, stockItem = stockItem, route = route, consumer = consumer, demand = demand }
+        Search.Goal (Found supplier stockItem route) _ ->
+            Just { supplier = supplier, stockItem = stockItem, route = route, consumer = consumer, demand = demand }
 
         _ ->
             Nothing
@@ -613,6 +605,10 @@ roadToNE (Road ne) =
 
 type alias OrderId =
     Int
+
+
+type alias Orders =
+    List Order
 
 
 type alias Order =
@@ -978,8 +974,8 @@ type alias BuildingId =
 
 type alias Building =
     { id : Int
-    , resources : Int
     , demands : List Demand
+    , producer : Producer
     , stock : List StockItem
     , entry : GP
     , entryToCenterOffset : Float2
@@ -988,12 +984,34 @@ type alias Building =
     }
 
 
+type BuildingType
+    = Well
+
+
+type Producer
+    = Infinite { every : Int, resource : Resource }
+    | NoProduction
+
+
 type Demand
     = Demand Int Resource (List OrderId)
 
 
 type StockItem
     = StockItem Int Resource (List OrderId)
+
+
+type alias SI =
+    { capacity : Int
+    , io : IO
+    , available : Int
+    , reserved : List OrderId
+    }
+
+
+type IO
+    = In
+    | Out
 
 
 type alias BuildingRef =
@@ -1061,25 +1079,25 @@ buildingToRef b =
 
 
 b0 =
-    { id = 0, resources = 5, demands = [], stock = [ StockItem 5 Water [] ], entry = ( 2, 3 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWater }
+    { id = 0, demands = [], stock = [ StockItem 5 Water [] ], producer = NoProduction, entry = ( 2, 3 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWater }
 
 
 b1 =
-    { id = 1, resources = 5, demands = [], stock = [], entry = ( 5, 3 ), entryToCenterOffset = ( 0, 2 ), size = ( 3, 3 ), fill = colorHQGray }
+    { id = 1, demands = [], stock = [], producer = NoProduction, entry = ( 5, 3 ), entryToCenterOffset = ( 0, 2 ), size = ( 3, 3 ), fill = colorHQGray }
 
 
 b3 =
-    { id = 3, resources = 5, demands = [], stock = [], entry = ( 7, 6 ), entryToCenterOffset = ( 1.5, 0 ), size = ( 2, 3 ), fill = colorWood }
+    { id = 3, demands = [], stock = [], producer = NoProduction, entry = ( 7, 6 ), entryToCenterOffset = ( 1.5, 0 ), size = ( 2, 3 ), fill = colorWood }
 
 
 b4 =
-    { id = 4, resources = 5, demands = [ Demand 5 Water [] ], stock = [], entry = ( 4, 8 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWood }
+    { id = 4, demands = [ Demand 5 Water [] ], stock = [], producer = NoProduction, entry = ( 4, 8 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWood }
 
 
 initialBuildings =
     [ b0
     , b1
-    , { id = 2, resources = 5, demands = [], stock = [], entry = ( 6, 3 ), entryToCenterOffset = ( 0, -1.5 ), size = ( 3, 2 ), fill = colorWater }
+    , { id = 2, demands = [], stock = [], producer = NoProduction, entry = ( 6, 3 ), entryToCenterOffset = ( 0, -1.5 ), size = ( 3, 2 ), fill = colorWater }
     , b3
     , b4
     ]
@@ -1110,8 +1128,6 @@ viewBuilding b =
                 , strokeWidth strokeThickness
                 , SA.rx "5"
                 ]
-
-            -- , words (String.fromInt b.resources) [ fill strokeColor ]
             , viewStock b.stock
             , viewDemands b.demands
             ]
@@ -1245,6 +1261,10 @@ polyline pts attrs =
 
 
 -- BASICS
+
+
+applyN n fn a =
+    List.repeat n fn |> List.foldl (<|) a
 
 
 atLeast =
