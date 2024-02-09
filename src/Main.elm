@@ -73,30 +73,41 @@ update msg model =
 updateOnTick : Model -> Model
 updateOnTick =
     (\model -> { model | step = model.step + 1 })
-        >> (\model ->
-                let
-                    orders =
-                        createOrders model
+        >> createAndAssignOrders
+        >> stepDriversAndProcessEvents
 
-                    ( drivers, buildings ) =
-                        assignOrders model.drivers model.buildings orders
-                in
-                { model | drivers = drivers, buildings = buildings }
-           )
-        >> (\model ->
-                let
-                    ( drivers, events ) =
-                        driversStep model.drivers
-                in
-                ( events, { model | drivers = drivers } )
-           )
-        >> (\( events, model ) ->
-                let
-                    ( drivers, buildings ) =
-                        processDriverEvents model.drivers model.buildings events
-                in
-                { model | drivers = drivers, buildings = buildings }
-           )
+
+createAndAssignOrders : Model -> Model
+createAndAssignOrders =
+    \model ->
+        let
+            orders =
+                createOrders model
+
+            ( drivers, buildings ) =
+                assignOrders model.drivers model.buildings orders
+        in
+        { model | drivers = drivers, buildings = buildings }
+
+
+stepDriversAndProcessEvents : Model -> Model
+stepDriversAndProcessEvents =
+    let
+        stepDrivers model =
+            let
+                ( drivers, events ) =
+                    driversStep model.drivers
+            in
+            ( events, { model | drivers = drivers } )
+
+        processEvents ( events, model ) =
+            let
+                ( drivers, buildings ) =
+                    processDriverEvents model.drivers model.buildings events
+            in
+            { model | drivers = drivers, buildings = buildings }
+    in
+    stepDrivers >> processEvents
 
 
 createOrders model =
@@ -374,15 +385,6 @@ driversStep drivers =
 
 processDriverEvents drivers buildings events =
     List.foldl processDriverEvent ( drivers, buildings ) events
-
-
-
--- processDriverEvents events model =
---     let
---         ( drivers, buildings ) =
---             List.foldl processDriverEvent ( model.drivers, model.buildings ) events
---     in
---     { model | drivers = drivers, buildings = buildings }
 
 
 processDriverEvent (AtEndOf deliveryLeg o) ( drivers, buildings ) =
