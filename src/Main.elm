@@ -213,28 +213,17 @@ assembleResourceContenders requests =
         |> LE.gatherEqualsBy .supplier
         |> List.concatMap
             (NE.toList
-                >> LE.gatherEqualsBy .stockItem
+                >> LE.gatherEqualsBy .resource
                 >> List.map
                     (\( h, t ) ->
-                        let
-                            (StockItem available resource _) =
-                                h.stockItem
-
-                            supplier =
-                                h.supplier
-                        in
-                        { supplier = supplier
-                        , available = available
-                        , resource = resource
+                        { supplier = h.supplier
+                        , available = h.available
+                        , resource = h.resource
                         , contenders =
                             (h :: t)
                                 |> List.sortBy (.route >> NE.length)
                                 |> List.map
-                                    (\{ consumer, route, demand } ->
-                                        let
-                                            (Demand required _ _) =
-                                                demand
-                                        in
+                                    (\{ consumer, route, required } ->
                                         { consumer = consumer, required = required, route = route }
                                     )
                         }
@@ -244,10 +233,11 @@ assembleResourceContenders requests =
 
 type alias Request =
     { supplier : Building
-    , stockItem : StockItem
+    , resource : Resource
+    , available : Int
+    , required : Int
     , route : Route
     , consumer : Building
-    , demand : Demand
     }
 
 
@@ -265,7 +255,7 @@ assembleRequests model =
 
 
 findShortestPathToSupplier : Demand -> Building -> Model -> Maybe Request
-findShortestPathToSupplier ((Demand _ resource _) as demand) consumer model =
+findShortestPathToSupplier ((Demand required resource _) as demand) consumer model =
     let
         result =
             model.drivers
@@ -276,8 +266,8 @@ findShortestPathToSupplier ((Demand _ resource _) as demand) consumer model =
                 |> Search.nextGoal
     in
     case result of
-        Search.Goal (Found supplier stockItem route) _ ->
-            Just { supplier = supplier, stockItem = stockItem, route = route, consumer = consumer, demand = demand }
+        Search.Goal (Found supplier available route) _ ->
+            Just { supplier = supplier, resource = resource, available = available, route = route, consumer = consumer, required = required }
 
         _ ->
             Nothing
@@ -285,7 +275,7 @@ findShortestPathToSupplier ((Demand _ resource _) as demand) consumer model =
 
 type SearchState
     = Ongoing Route
-    | Found Building StockItem Route
+    | Found Building Int Route
 
 
 type alias Route =
@@ -312,7 +302,7 @@ initSearchState consumer resource buildings prevRouteSegments routeSegment =
     LE.findMap
         (\b ->
             if b.id /= consumer.id && driverServicesGP b.entry routeSegment.driver then
-                buildingStockItemForResource resource b |> Maybe.map (\stockItem -> Found b stockItem ( routeSegment, prevRouteSegments ))
+                buildingStockItemForSupply resource b |> Maybe.map (\{ available } -> Found b available ( routeSegment, prevRouteSegments ))
 
             else
                 Nothing
@@ -976,7 +966,7 @@ type alias Building =
     { id : Int
     , demands : List Demand
     , producer : Producer
-    , stock : List StockItem
+    , stock : List SI
     , entry : GP
     , entryToCenterOffset : Float2
     , size : Int2
@@ -997,13 +987,14 @@ type Demand
     = Demand Int Resource (List OrderId)
 
 
-type StockItem
-    = StockItem Int Resource (List OrderId)
+type alias Stock =
+    List SI
 
 
 type alias SI =
     { capacity : Int
     , io : IO
+    , resource : Resource
     , available : Int
     , reserved : List OrderId
     }
@@ -1018,9 +1009,9 @@ type alias BuildingRef =
     { id : Int, gp : GP }
 
 
-buildingStockItemForResource : Resource -> Building -> Maybe StockItem
-buildingStockItemForResource resource_ b =
-    LE.find (\((StockItem _ resource _) as stockItem) -> resource == resource_) b.stock
+buildingStockItemForSupply : Resource -> Building -> Maybe SI
+buildingStockItemForSupply resource b =
+    LE.find (\si -> si.io == Out && si.resource == resource) b.stock
 
 
 buildingRegisterOrderWithDemand : Order -> Building -> Building
@@ -1053,9 +1044,9 @@ buildingReserveStockForOrder : Order -> Building -> Building
 buildingReserveStockForOrder o b =
     let
         stock =
-            updateExactlyOne (\(StockItem unassigned resource _) -> resource == o.resource && unassigned > 0)
-                (\(StockItem unassigned resource reservedOrderIds) ->
-                    StockItem (unassigned - 1) resource (o.id :: reservedOrderIds)
+            updateExactlyOne (\si -> si.io == Out && si.resource == o.resource && si.available > 0)
+                (\si ->
+                    { si | available = si.available - 1, reserved = o.id :: si.reserved }
                 )
                 b.stock
     in
@@ -1065,9 +1056,9 @@ buildingReserveStockForOrder o b =
 buildingUpdateOnOrderPickup orderId b =
     let
         stock =
-            updateExactlyOne (\(StockItem _ _ reservedOrderIds) -> List.member orderId reservedOrderIds)
-                (\(StockItem unassigned resource reservedOrderIds) ->
-                    StockItem unassigned resource (LE.remove orderId reservedOrderIds)
+            updateExactlyOne (\si -> List.member orderId si.reserved)
+                (\si ->
+                    { si | reserved = LE.remove orderId si.reserved }
                 )
                 b.stock
     in
@@ -1078,22 +1069,38 @@ buildingToRef b =
     { id = b.id, gp = b.entry }
 
 
+initialWellStock : Stock
+initialWellStock =
+    [ { io = Out, capacity = 4, available = 4, resource = Water, reserved = [] } ]
+
+
+b0 : Building
 b0 =
-    { id = 0, demands = [], stock = [ StockItem 5 Water [] ], producer = NoProduction, entry = ( 2, 3 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWater }
+    { id = 0, demands = [], stock = initialWellStock, producer = NoProduction, entry = ( 2, 3 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWater }
 
 
+b1 : Building
 b1 =
     { id = 1, demands = [], stock = [], producer = NoProduction, entry = ( 5, 3 ), entryToCenterOffset = ( 0, 2 ), size = ( 3, 3 ), fill = colorHQGray }
 
 
+b3 : Building
 b3 =
     { id = 3, demands = [], stock = [], producer = NoProduction, entry = ( 7, 6 ), entryToCenterOffset = ( 1.5, 0 ), size = ( 2, 3 ), fill = colorWood }
 
 
+b4 : Building
 b4 =
-    { id = 4, demands = [ Demand 5 Water [] ], stock = [], producer = NoProduction, entry = ( 4, 8 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWood }
+    let
+        demand : SI
+        demand =
+            {io=In, capacity=5, available=0, reserved=[], resource=Water}
+    in
+
+    { id = 4, demands = [ Demand 5 Water [] ], stock = [demand], producer = NoProduction, entry = ( 4, 8 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWood }
 
 
+initialBuildings : Buildings
 initialBuildings =
     [ b0
     , b1
@@ -1140,14 +1147,21 @@ viewBuilding b =
         ]
 
 
+viewStock : Stock -> Html msg
 viewStock stock =
     let
-        viewStockItem (StockItem unassigned resource reservedOrderIds) =
+        viewStockItem si =
             let
-                ct =
-                    unassigned + List.length reservedOrderIds
+                stored =
+                    si.available + List.length si.reserved
+
+                string =
+                    "$IO $RESOURCE $STORED"
+                        |> String.replace "$IO" (Debug.toString si.io)
+                        |> String.replace "$RESOURCE" (Debug.toString si.resource)
+                        |> String.replace "$STORED" (Debug.toString stored)
             in
-            words ("P " ++ Debug.toString resource ++ ": " ++ String.fromInt ct) [ fill strokeColor ]
+            words string [ fill strokeColor, style "font-size" "16px", style "font-family" "monospace" ]
     in
     group [ styleTranslate ( 0, -cellGap * 2 ) ] (List.map viewStockItem stock)
 
@@ -1156,10 +1170,10 @@ viewDemands demands =
     let
         viewDemand (Demand unassigned resource reservedOrderIds) =
             let
-                ct =
+                stored =
                     unassigned + List.length reservedOrderIds
             in
-            words ("C " ++ Debug.toString resource ++ ": " ++ String.fromInt ct) [ fill strokeColor ]
+            words ("C " ++ Debug.toString resource ++ ": " ++ String.fromInt stored) [ fill strokeColor ]
     in
     group [ styleTranslate ( 0, cellGap * 2 ) ] (List.map viewDemand demands)
 
