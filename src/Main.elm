@@ -1072,6 +1072,10 @@ siHasFreeCapacity si =
     siFreeCapacity si > 0
 
 
+siIsAvailable si =
+    si.available > 0
+
+
 siIncrementAvailable : SI -> Maybe SI
 siIncrementAvailable si =
     if siFreeCapacity si > 0 then
@@ -1131,54 +1135,48 @@ siIsInResourceWithFreeCapacity resource =
     allPass [ siIsIn, siIsResource resource, siHasFreeCapacity ]
 
 
+siIsOutResourceAvailable resource =
+    allPass [ siIsOut, siIsResource resource, siIsAvailable ]
+
+
+buildingUpdateStockItem pred fn b =
+    { b | stock = updateExactlyOne pred fn b.stock }
+
+
 buildingRegisterInboundOrder : Order -> Building -> Building
-buildingRegisterInboundOrder o b =
-    let
-        stock =
-            updateExactlyOne
-                (siIsInResourceWithFreeCapacity o.resource)
-                (\si -> { si | reserved = o.id :: si.reserved })
-                b.stock
-    in
-    { b | stock = stock }
+buildingRegisterInboundOrder o =
+    buildingUpdateStockItem
+        (siIsInResourceWithFreeCapacity o.resource)
+        (\si -> { si | reserved = o.id :: si.reserved })
 
 
 buildingReserveStockForOrder : Order -> Building -> Building
-buildingReserveStockForOrder o b =
-    let
-        stock =
-            updateExactlyOne (\si -> si.io == Out && si.resource == o.resource && si.available > 0)
-                (\si ->
-                    { si | available = si.available - 1, reserved = o.id :: si.reserved }
-                )
-                b.stock
-    in
-    { b | stock = stock }
+buildingReserveStockForOrder o =
+    buildingUpdateStockItem (siIsOutResourceAvailable o.resource)
+        (\si -> { si | available = si.available - 1, reserved = o.id :: si.reserved })
 
 
-buildingUpdateOnOrderPickup orderId b =
-    let
-        stock =
-            updateExactlyOne (\si -> List.member orderId si.reserved)
-                (\si ->
-                    { si | reserved = LE.remove orderId si.reserved }
-                )
-                b.stock
-    in
-    { b | stock = stock }
+siIsReserved orderId si =
+    List.member orderId si.reserved
+
+
+siIsOutReserved orderId =
+    allPass [ siIsOut, siIsReserved orderId ]
+
+
+siIsInReserved orderId =
+    allPass [ siIsIn, siIsReserved orderId ]
+
+
+buildingUpdateOnOrderPickup orderId =
+    buildingUpdateStockItem (siIsOutReserved orderId)
+        (\si -> { si | reserved = LE.remove orderId si.reserved })
 
 
 buildingUpdateOnOrderDropoff : OrderId -> Building -> Building
-buildingUpdateOnOrderDropoff orderId b =
-    let
-        stock =
-            updateExactlyOne (\si -> si.io == In && List.member orderId si.reserved)
-                (\si ->
-                    { si | available = si.available + 1, reserved = LE.remove orderId si.reserved }
-                )
-                b.stock
-    in
-    { b | stock = stock }
+buildingUpdateOnOrderDropoff orderId=
+    buildingUpdateStockItem (siIsInReserved orderId)
+        (\si -> { si | available = si.available + 1, reserved = LE.remove orderId si.reserved })
 
 
 buildingToRef b =
