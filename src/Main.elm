@@ -248,7 +248,7 @@ assembleRequests model =
         |> List.concatMap
             (\consumer ->
                 consumer
-                    |> buildingUnfulfiledRequirements
+                    |> buildingRequiredResources
                     |> List.filterMap
                         (\requirement ->
                             findShortestPathToSupplier requirement consumer model
@@ -304,7 +304,7 @@ initSearchState consumer resource buildings prevRouteSegments routeSegment =
     LE.findMap
         (\b ->
             if b.id /= consumer.id && driverCanServeGP b.entry routeSegment.driver then
-                buildingAvailableSupply resource b
+                buildingAvailableOutResource resource b
                     |> Maybe.map
                         (\available ->
                             Found
@@ -358,7 +358,7 @@ assignOrder : Order -> Model -> Model
 assignOrder order =
     updateDriverWithId order.initialDriverId (driverAssignOrder order)
         >> updateBuildingWithId order.from.id (buildingReserveStockForOrder order)
-        >> updateBuildingWithId order.to.id (buildingRegisterOrderWithDemand order)
+        >> updateBuildingWithId order.to.id (buildingReserveRequirementWithOrder order)
 
 
 driversStep : Drivers -> ( Drivers, List DriverEvent )
@@ -1047,12 +1047,16 @@ siMatchesResource resource si =
     si.resource == resource
 
 
-siCanBeSupplied si =
+siIsOut si =
     si.io == Out
 
 
-siCanSupplyAndEqResource resource =
-    allPass [ siMatchesResource resource, siCanBeSupplied ]
+siIsIn si =
+    si.io == In
+
+
+siIsOutResource resource =
+    allPass [ siMatchesResource resource, siIsOut ]
 
 
 allPass preds val =
@@ -1077,7 +1081,7 @@ outStockStoreResource : Resource -> Stock -> Maybe Stock
 outStockStoreResource resource stock =
     let
         newStock =
-            updateExactlyOne (siCanSupplyAndEqResource resource)
+            updateExactlyOne (siIsOutResource resource)
                 (\si -> siIncrementAvailable si |> Maybe.withDefault si)
                 stock
     in
@@ -1102,10 +1106,10 @@ buildingStep _ b =
             b
 
 
-buildingUnfulfiledRequirements : Building -> List { required : Int, resource : Resource }
-buildingUnfulfiledRequirements b =
+buildingRequiredResources : Building -> List { required : Int, resource : Resource }
+buildingRequiredResources b =
     b.stock
-        |> List.filter (\si -> si.io == In)
+        |> List.filter siIsIn
         |> List.map
             (\si ->
                 { required = siFreeCapacity si
@@ -1114,13 +1118,13 @@ buildingUnfulfiledRequirements b =
             )
 
 
-buildingAvailableSupply : Resource -> Building -> Maybe Int
-buildingAvailableSupply resource b =
-    LE.find (siCanSupplyAndEqResource resource) b.stock |> Maybe.map .available
+buildingAvailableOutResource : Resource -> Building -> Maybe Int
+buildingAvailableOutResource resource b =
+    LE.find (siIsOutResource resource) b.stock |> Maybe.map .available
 
 
-buildingRegisterOrderWithDemand : Order -> Building -> Building
-buildingRegisterOrderWithDemand o b =
+buildingReserveRequirementWithOrder : Order -> Building -> Building
+buildingReserveRequirementWithOrder o b =
     let
         stock =
             updateExactlyOne (\si -> si.io == In && si.resource == o.resource && (si.available + List.length si.reserved < si.capacity))
