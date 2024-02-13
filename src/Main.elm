@@ -358,7 +358,7 @@ assignOrder : Order -> Model -> Model
 assignOrder order =
     updateDriverWithId order.initialDriverId (driverAssignOrder order)
         >> updateBuildingWithId order.from.id (buildingReserveStockForOrder order)
-        >> updateBuildingWithId order.to.id (buildingReserveRequirementWithOrder order)
+        >> updateBuildingWithId order.to.id (buildingRegisterInboundOrder order)
 
 
 driversStep : Drivers -> ( Drivers, List DriverEvent )
@@ -1043,7 +1043,7 @@ type alias Stock =
     List SI
 
 
-siMatchesResource resource si =
+siIsResource resource si =
     si.resource == resource
 
 
@@ -1056,7 +1056,7 @@ siIsIn si =
 
 
 siIsOutResource resource =
-    allPass [ siMatchesResource resource, siIsOut ]
+    allPass [ siIsResource resource, siIsOut ]
 
 
 allPass preds val =
@@ -1066,6 +1066,10 @@ allPass preds val =
 
 siFreeCapacity si =
     si.capacity - (si.available + List.length si.reserved)
+
+
+siHasFreeCapacity si =
+    siFreeCapacity si > 0
 
 
 siIncrementAvailable : SI -> Maybe SI
@@ -1123,14 +1127,17 @@ buildingAvailableOutResource resource b =
     LE.find (siIsOutResource resource) b.stock |> Maybe.map .available
 
 
-buildingReserveRequirementWithOrder : Order -> Building -> Building
-buildingReserveRequirementWithOrder o b =
+siIsInResourceWithFreeCapacity resource =
+    allPass [ siIsIn, siIsResource resource, siHasFreeCapacity ]
+
+
+buildingRegisterInboundOrder : Order -> Building -> Building
+buildingRegisterInboundOrder o b =
     let
         stock =
-            updateExactlyOne (\si -> si.io == In && si.resource == o.resource && (si.available + List.length si.reserved < si.capacity))
-                (\si ->
-                    { si | reserved = o.id :: si.reserved }
-                )
+            updateExactlyOne
+                (siIsInResourceWithFreeCapacity o.resource)
+                (\si -> { si | reserved = o.id :: si.reserved })
                 b.stock
     in
     { b | stock = stock }
