@@ -357,7 +357,7 @@ searchStateCost state =
 assignOrder : Order -> Model -> Model
 assignOrder order =
     updateDriverWithId order.initialDriverId (driverAssignOrder order)
-        >> updateBuildingWithId order.from.id (buildingReserveStockForOrder order)
+        >> updateBuildingWithId order.from.id (buildingRegisterOutboundOrder order)
         >> updateBuildingWithId order.to.id (buildingRegisterInboundOrder order)
 
 
@@ -750,7 +750,7 @@ driverHandoverGPForEndPoint ep d =
     in
     Pivot.toList d.pos
         |> ME.oneOf [ fn, List.reverse >> fn ]
-        |> ME.withDefaultLazy (\_ -> Debug.todo "handover for gp not found")
+        |> ME.withDefaultLazy (\_ -> Debug.todo "handover for endpoint not found")
 
 
 driverCanServeGP : GP -> Driver -> Bool
@@ -783,7 +783,7 @@ driverNotifyHandoverCompleted id d =
     case d.state of
         WaitingForHandover o ->
             if id == o.id then
-                processPendingOrders d
+                driverProcessPendingOrders d
 
             else
                 Debug.todo "not WaitingForHandover"
@@ -796,42 +796,34 @@ stepDriver : Driver -> ( Driver, Maybe DriverEvent )
 stepDriver d =
     case d.state of
         Idle ->
-            ( processPendingOrders d, Nothing )
+            ( driverProcessPendingOrders d, Nothing )
 
         WaitingForHandover _ ->
             ( d, Nothing )
 
         PickingUp o ->
-            let
-                gp =
-                    orderCurrentPickupGP o
-            in
-            if driverCurrentGP d == gp then
-                ( { d | state = DroppingOff o }, Just (DriverAtPickupDest o) )
-
-            else
-                ( driverMoveTowardsGP gp d, Nothing )
+            driverMoveTowards (orderCurrentPickupGP o) d
+                |> ME.withDefaultLazy
+                    (\_ ->
+                        ( { d | state = DroppingOff o }, Just (DriverAtPickupDest o) )
+                    )
 
         DroppingOff o ->
-            let
-                gp =
-                    orderCurrentDropOffGP o
-            in
-            if driverCurrentGP d == gp then
-                ( if orderShouldWaitForDropoffCompletion o then
-                    { d | state = WaitingForHandover o }
+            driverMoveTowards (orderCurrentDropOffGP o) d
+                |> ME.withDefaultLazy
+                    (\_ ->
+                        ( if orderShouldWaitForDropoffCompletion o then
+                            { d | state = WaitingForHandover o }
 
-                  else
-                    processPendingOrders d
-                , Just (DriverAtDropoffDest o)
-                )
-
-            else
-                ( driverMoveTowardsGP gp d, Nothing )
+                          else
+                            driverProcessPendingOrders d
+                        , Just (DriverAtDropoffDest o)
+                        )
+                    )
 
 
-processPendingOrders : Driver -> Driver
-processPendingOrders d =
+driverProcessPendingOrders : Driver -> Driver
+driverProcessPendingOrders d =
     case d.pendingOrders of
         o :: pendingOrders ->
             { d | state = PickingUp o, pendingOrders = pendingOrders }
@@ -840,17 +832,25 @@ processPendingOrders d =
             { d | state = Idle }
 
 
-driverMoveTowardsGP : GP -> Driver -> Driver
-driverMoveTowardsGP gp d =
-    { d | pos = moveTowards gp d.pos }
+driverMoveTowards : GP -> Driver -> Maybe ( Driver, Maybe DriverEvent )
+driverMoveTowards gp d =
+    if driverCurrentGP d == gp then
+        Nothing
+
+    else
+        Just ( driverMapPos (driverPosMoveTowards gp) d, Nothing )
 
 
-moveTowards gp pos =
+driverMapPos fn d =
+    { d | pos = fn d.pos }
+
+
+driverPosMoveTowards gp pos =
     if Pivot.getR pos |> List.member gp then
         withRollback Pivot.goR pos
 
     else if Pivot.getL pos |> List.member gp then
-        moveTowards gp (Pivot.reverse pos)
+        driverPosMoveTowards gp (Pivot.reverse pos)
 
     else
         Debug.todo ("invalid move pos." ++ Debug.toString ( gp, pos ))
@@ -1014,7 +1014,7 @@ producerStep stock p =
             Nothing
 
         Infinite ({ every, resource, elapsed } as r) ->
-            outStockStoreResource resource stock
+            stockStoreOutResource resource stock
                 |> Maybe.map
                     (\newStock ->
                         if elapsed + 1 >= every then
@@ -1085,8 +1085,8 @@ siIncrementAvailable si =
         Nothing
 
 
-outStockStoreResource : Resource -> Stock -> Maybe Stock
-outStockStoreResource resource stock =
+stockStoreOutResource : Resource -> Stock -> Maybe Stock
+stockStoreOutResource resource stock =
     let
         newStock =
             updateExactlyOne (siIsOutResource resource)
@@ -1139,23 +1139,6 @@ siIsOutResourceAvailable resource =
     allPass [ siIsOut, siIsResource resource, siIsAvailable ]
 
 
-buildingUpdateStockItem pred fn b =
-    { b | stock = updateExactlyOne pred fn b.stock }
-
-
-buildingRegisterInboundOrder : Order -> Building -> Building
-buildingRegisterInboundOrder o =
-    buildingUpdateStockItem
-        (siIsInResourceWithFreeCapacity o.resource)
-        (\si -> { si | reserved = o.id :: si.reserved })
-
-
-buildingReserveStockForOrder : Order -> Building -> Building
-buildingReserveStockForOrder o =
-    buildingUpdateStockItem (siIsOutResourceAvailable o.resource)
-        (\si -> { si | available = si.available - 1, reserved = o.id :: si.reserved })
-
-
 siIsReserved orderId si =
     List.member orderId si.reserved
 
@@ -1168,13 +1151,30 @@ siIsInReserved orderId =
     allPass [ siIsIn, siIsReserved orderId ]
 
 
+buildingUpdateStockItem pred fn b =
+    { b | stock = updateExactlyOne pred fn b.stock }
+
+
+buildingRegisterInboundOrder : Order -> Building -> Building
+buildingRegisterInboundOrder o =
+    buildingUpdateStockItem
+        (siIsInResourceWithFreeCapacity o.resource)
+        (\si -> { si | reserved = o.id :: si.reserved })
+
+
+buildingRegisterOutboundOrder : Order -> Building -> Building
+buildingRegisterOutboundOrder o =
+    buildingUpdateStockItem (siIsOutResourceAvailable o.resource)
+        (\si -> { si | available = si.available - 1, reserved = o.id :: si.reserved })
+
+
 buildingUpdateOnOrderPickup orderId =
     buildingUpdateStockItem (siIsOutReserved orderId)
         (\si -> { si | reserved = LE.remove orderId si.reserved })
 
 
 buildingUpdateOnOrderDropoff : OrderId -> Building -> Building
-buildingUpdateOnOrderDropoff orderId=
+buildingUpdateOnOrderDropoff orderId =
     buildingUpdateStockItem (siIsInReserved orderId)
         (\si -> { si | available = si.available + 1, reserved = LE.remove orderId si.reserved })
 
