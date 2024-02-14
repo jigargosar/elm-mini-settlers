@@ -90,7 +90,10 @@ stepDriversAndProcessEvents =
         stepDrivers model =
             let
                 ( drivers, events ) =
-                    driversStep model.drivers
+                    model.drivers
+                        |> List.map driverStep
+                        |> List.unzip
+                        |> Tuple.mapSecond (List.filterMap identity)
             in
             ( events, { model | drivers = drivers } )
 
@@ -269,7 +272,14 @@ findShortestPathToSupplier { required, resource } consumer model =
     in
     case result of
         Search.Goal (Found { supplier, available, route }) _ ->
-            Just { supplier = supplier, resource = resource, available = available, route = route, consumer = consumer, required = required }
+            Just
+                { supplier = supplier
+                , resource = resource
+                , available = available
+                , route = route
+                , consumer = consumer
+                , required = required
+                }
 
         _ ->
             Nothing
@@ -359,13 +369,6 @@ assignOrder order =
     updateDriverWithId order.initialDriverId (driverAssignOrder order)
         >> updateBuildingWithId order.from.id (buildingRegisterOutboundOrder order)
         >> updateBuildingWithId order.to.id (buildingRegisterInboundOrder order)
-
-
-driversStep : Drivers -> ( Drivers, List DriverEvent )
-driversStep drivers =
-    List.map stepDriver drivers
-        |> List.unzip
-        |> Tuple.mapSecond (List.filterMap identity)
 
 
 mapBuildings fn model =
@@ -524,6 +527,10 @@ roadThickness =
 
 driverDiameter =
     roadEndpointDiameter
+
+
+colorApple =
+    "#66b447"
 
 
 colorWood =
@@ -792,8 +799,8 @@ driverNotifyHandoverCompleted id d =
             Debug.todo "not WaitingForHandover"
 
 
-stepDriver : Driver -> ( Driver, Maybe DriverEvent )
-stepDriver d =
+driverStep : Driver -> ( Driver, Maybe DriverEvent )
+driverStep d =
     case d.state of
         Idle ->
             ( driverProcessPendingOrders d, Nothing )
@@ -963,6 +970,7 @@ driversUpdateWithId driverId fn drivers =
 type Resource
     = Water
     | Wood
+    | Apple
 
 
 resourceColor r =
@@ -972,6 +980,9 @@ resourceColor r =
 
         Wood ->
             colorWood
+
+        Apple ->
+            colorApple
 
 
 
@@ -1003,8 +1014,12 @@ type alias BuildingId =
 
 
 type Producer
-    = Infinite { every : Int, resource : Resource, elapsed : Int }
+    = Infinite { every : Int, inputs : List ResourceQuantity, output : Resource, elapsed : Int }
     | NoProduction
+
+
+type alias ResourceQuantity =
+    { resource : Resource, quantity : Int }
 
 
 producerStep : Stock -> Producer -> Maybe ( Stock, Producer )
@@ -1013,8 +1028,8 @@ producerStep stock p =
         NoProduction ->
             Nothing
 
-        Infinite ({ every, resource, elapsed } as r) ->
-            stockStoreOutResource resource stock
+        Infinite ({ every, inputs, output, elapsed } as r) ->
+            stockPerformIO inputs output stock
                 |> Maybe.map
                     (\newStock ->
                         if elapsed + 1 >= every then
@@ -1076,8 +1091,21 @@ siIsAvailable si =
     si.available > 0
 
 
-siIncrementAvailable : SI -> Maybe SI
-siIncrementAvailable si =
+siAvailableQuantity si =
+    si.available
+
+
+siConsume : Int -> SI -> Maybe SI
+siConsume quantity si =
+    if siAvailableQuantity si >= quantity then
+        Just { si | available = si.available - quantity }
+
+    else
+        Nothing
+
+
+siProduce : SI -> Maybe SI
+siProduce si =
     if siFreeCapacity si > 0 then
         Just { si | available = si.available + 1 }
 
@@ -1085,12 +1113,40 @@ siIncrementAvailable si =
         Nothing
 
 
+stockPerformIO : List ResourceQuantity -> Resource -> Stock -> Maybe Stock
+stockPerformIO inputs output stock =
+    stock
+        |> stockConsumeInputs inputs
+        |> Maybe.andThen (stockStoreOutResource output)
+
+
+stockConsumeInputs : List ResourceQuantity -> Stock -> Maybe Stock
+stockConsumeInputs inputs stock =
+    inputs
+        |> List.foldl (\rq -> Maybe.andThen (stockConsumeInput rq)) (Just stock)
+
+
+stockConsumeInput : ResourceQuantity -> Stock -> Maybe Stock
+stockConsumeInput rq stock =
+    let
+        newStock =
+            updateExactlyOne (allPass [ siIsIn, siIsResource rq.resource ])
+                (\si -> si |> siConsume rq.quantity |> Maybe.withDefault si)
+                stock
+    in
+    if stock == newStock then
+        Nothing
+
+    else
+        Just newStock
+
+
 stockStoreOutResource : Resource -> Stock -> Maybe Stock
 stockStoreOutResource resource stock =
     let
         newStock =
             updateExactlyOne (siIsOutResource resource)
-                (\si -> siIncrementAvailable si |> Maybe.withDefault si)
+                (\si -> siProduce si |> Maybe.withDefault si)
                 stock
     in
     if stock == newStock then
@@ -1190,42 +1246,105 @@ initialWellStock =
 
 wellWaterProducer : Producer
 wellWaterProducer =
-    Infinite { every = 12, resource = Water, elapsed = 0 }
+    Infinite { every = 12, inputs = [], output = Water, elapsed = 0 }
 
 
 b0 : Building
 b0 =
-    { id = 0, stock = initialWellStock, producer = wellWaterProducer, entry = ( 2, 3 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWater }
+    { id = 0
+    , stock = initialWellStock
+    , producer = wellWaterProducer
+    , entry = ( 2, 3 )
+    , entryToCenterOffset = ( 0, 1.5 )
+    , size = ( 3, 2 )
+    , fill = colorWater
+    }
 
 
 b1 : Building
 b1 =
-    { id = 1, stock = [], producer = NoProduction, entry = ( 5, 3 ), entryToCenterOffset = ( 0, 2 ), size = ( 3, 3 ), fill = colorHQGray }
+    { id = 1
+    , stock = []
+    , producer = NoProduction
+    , entry = ( 5, 3 )
+    , entryToCenterOffset = ( 0, 2 )
+    , size = ( 3, 3 )
+    , fill = colorHQGray
+    }
+
+
+b2 : Building
+b2 =
+    { id = 2
+    , stock = initialWellStock
+    , producer = wellWaterProducer
+    , entry = ( 6, 3 )
+    , entryToCenterOffset = ( 0, -1.5 )
+    , size = ( 3, 2 )
+    , fill = colorWater
+    }
 
 
 b3 : Building
 b3 =
-    { id = 3, stock = [], producer = NoProduction, entry = ( 7, 6 ), entryToCenterOffset = ( 1.5, 0 ), size = ( 2, 3 ), fill = colorWood }
+    let
+        demand : SI
+        demand =
+            { io = In, capacity = 3, available = 0, reserved = [], resource = Water }
+
+        supply : SI
+        supply =
+            { io = Out, capacity = 2, available = 0, reserved = [], resource = Apple }
+
+        producer : Producer
+        producer =
+            Infinite { every = 3, inputs = [ { resource = Water, quantity = 1 } ], output = Apple, elapsed = 0 }
+    in
+    { id = 3
+
+    -- , stock = initialWellStock
+    -- , producer = wellWaterProducer
+    , stock = [ demand, supply ]
+    , producer = producer
+    , entry = ( 7, 6 )
+    , entryToCenterOffset = ( 1.5, 0 )
+    , size = ( 2, 3 )
+    , fill = colorApple
+    }
 
 
 b4 : Building
 b4 =
     let
-        demand : SI
-        demand =
-            { io = In, capacity = 5, available = 0, reserved = [], resource = Water }
+        demandWater : SI
+        demandWater =
+            { io = In, capacity = 3, available = 0, reserved = [], resource = Water }
+
+        demandApple : SI
+        demandApple =
+            { io = In, capacity = 3, available = 0, reserved = [], resource = Apple }
+
+        supply : SI
+        supply =
+            { io = Out, capacity = 2, available = 0, reserved = [], resource = Wood }
+
+        producer : Producer
+        producer =
+            Infinite { every = 3, inputs = [ { resource = Water, quantity = 1 }, { resource = Apple, quantity = 1 } ], output = Wood, elapsed = 0 }
     in
-    { id = 4, stock = [ demand ], producer = NoProduction, entry = ( 4, 8 ), entryToCenterOffset = ( 0, 1.5 ), size = ( 3, 2 ), fill = colorWood }
+    { id = 4
+    , stock = [ demandWater, demandApple, supply ]
+    , producer = producer
+    , entry = ( 4, 8 )
+    , entryToCenterOffset = ( 0, 1.5 )
+    , size = ( 3, 2 )
+    , fill = colorWood
+    }
 
 
 initialBuildings : Buildings
 initialBuildings =
-    [ b0
-    , b1
-    , { id = 2, stock = [], producer = NoProduction, entry = ( 6, 3 ), entryToCenterOffset = ( 0, -1.5 ), size = ( 3, 2 ), fill = colorWater }
-    , b3
-    , b4
-    ]
+    [ b0, b1, b2, b3, b4 ]
 
 
 viewBuilding : Building -> Svg msg
@@ -1267,7 +1386,7 @@ viewBuilding b =
 viewStock : Stock -> Html msg
 viewStock stock =
     let
-        viewStockItem si =
+        viewStockItem i si =
             let
                 stored =
                     case si.io of
@@ -1283,9 +1402,10 @@ viewStock stock =
                         |> String.replace "$RESOURCE" (Debug.toString si.resource)
                         |> String.replace "$STORED" (Debug.toString stored)
             in
-            words string [ fill strokeColor, style "font-size" "16px", style "font-family" "monospace" ]
+            group [ styleTranslate ( 0, toFloat i * cellGap ) ]
+                [ words string [ fill strokeColor, style "font-size" "13px", style "font-family" "monospace" ] ]
     in
-    group [ styleTranslate ( 0, -cellGap * 2 ) ] (List.map viewStockItem stock)
+    group [ styleTranslate ( 0, -cellGap * 2 ) ] (List.indexedMap viewStockItem stock)
 
 
 
