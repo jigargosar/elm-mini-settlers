@@ -56,10 +56,14 @@ type Msg
     = Tick
 
 
+tickDurationInMillis =
+    200
+
+
 subscriptions : Model -> Sub Msg
 subscriptions _ =
     Sub.batch
-        [ Time.every 500 (always Tick) ]
+        [ Time.every tickDurationInMillis (always Tick) ]
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -884,10 +888,21 @@ viewDriver d =
         ]
 
 
+defaultTransition =
+    style "transition"
+        ("translate $dur linear, scale $dur linear"
+            |> String.replace "$dur" (ms tickDurationInMillis)
+        )
+
+
+ms n =
+    String.fromFloat n ++ "ms"
+
+
 viewVehicle gp state =
     group
         [ styleTranslate (gpToWorld gp)
-        , style "transition" "translate 500ms linear, scale 500ms linear"
+        , defaultTransition
         , stroke strokeColor
         , strokeWidth strokeThickness
         ]
@@ -909,7 +924,7 @@ viewVehicle gp state =
           in
           circleWithDiameter driverDiameter
             [ maybeAttr mbResource (resourceColor >> fill)
-            , style "transition" "translate 500ms linear, scale 500ms linear"
+            , defaultTransition
             , style "scale" (ME.unwrap "0" (always "1") mbResource)
             ]
         ]
