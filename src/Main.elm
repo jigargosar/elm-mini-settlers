@@ -57,7 +57,7 @@ type Msg
 
 
 tickDurationInMillis =
-    200
+    100
 
 
 subscriptions : Model -> Sub Msg
@@ -1015,8 +1015,8 @@ buildingsUpdateWithId buildingId fn =
 
 type alias Building =
     { id : BuildingId
-    , producer : Producer
-    , stock : List SI
+    , constructionCost : List ResourceQuantity
+    , state : BuildingState
     , entry : GP
     , entryToCenterOffset : Float2
     , size : Int2
@@ -1024,12 +1024,41 @@ type alias Building =
     }
 
 
+
+-- building has construction costs
+-- hq doesn't have any
+-- all buildings once placed start in underconstruction phase
+-- all stock item are of type in
+-- required, available, resource. reserved.
+-- we could implement building phase, which can either store stock, or init it on change.
+-- producer and stock type are closely linked, i.e. it determines in and out resources.
+-- inventory capacity is the only thing independent of production.
+-- we could introduce state of type construction / production with or without including stock.
+-- initial state construction, then on completion, we switch to production.
+
+
 type alias BuildingId =
     Int
 
 
+type alias BuildingRef =
+    { id : Int, gp : GP }
+
+
+type BuildingState
+    = UnderConstruction { inStock : InStock, initialProducer : Producer }
+    | Producing Producer
+
+
 type Producer
-    = Infinite { every : Int, inputs : List ResourceQuantity, output : Resource, elapsed : Int }
+    = Infinite
+        { every : Int
+        , inputs : List ResourceQuantity
+        , output : Resource
+        , elapsed : Int
+        , inStock : InStock
+        , outStock : OutStock
+        }
     | NoProduction
 
 
@@ -1037,21 +1066,21 @@ type alias ResourceQuantity =
     { resource : Resource, quantity : Int }
 
 
-producerStep : Stock -> Producer -> Maybe ( Stock, Producer )
-producerStep stock p =
+producerStep : Producer -> Maybe Producer
+producerStep p =
     case p of
         NoProduction ->
             Nothing
 
         Infinite ({ every, inputs, output, elapsed } as r) ->
-            stockPerformIO inputs output stock
+            stockPerformIO inputs output r.inStock r.outStock
                 |> Maybe.map
-                    (\newStock ->
+                    (\stock ->
                         if elapsed + 1 >= every then
-                            ( newStock, Infinite { r | elapsed = 0 } )
+                            Infinite { r | elapsed = 0, inStock = stock.inStock, outStock = stock.outStock }
 
                         else
-                            ( stock, Infinite { r | elapsed = elapsed + 1 } )
+                            Infinite { r | elapsed = elapsed + 1 }
                     )
 
 
@@ -1064,13 +1093,133 @@ type alias SI =
     }
 
 
+type alias InSI =
+    { totalCapacity : Int
+    , resource : Resource
+    , filledCapacity : Int
+    , reservedCapacityForOrderIds : List OrderId
+    }
+
+
+initInStockItem : Int -> Resource -> InSI
+initInStockItem capacity resource =
+    { totalCapacity = capacity, resource = resource, filledCapacity = 0, reservedCapacityForOrderIds = [] }
+
+
+inStockItemToRequirement : InSI -> { required : Int, resource : Resource }
+inStockItemToRequirement r =
+    { required = inStockItemFreeCapacity r, resource = r.resource }
+
+
+inStockItemFreeCapacity : InSI -> Int
+inStockItemFreeCapacity r =
+    r.totalCapacity - (r.filledCapacity + List.length r.reservedCapacityForOrderIds)
+
+
+inStockItemHasFreeCapacity : InSI -> Bool
+inStockItemHasFreeCapacity r =
+    inStockItemFreeCapacity r > 0
+
+
+inStockItemIsResource : Resource -> InSI -> Bool
+inStockItemIsResource resource r =
+    r.resource == resource
+
+
+inStockItemIsResourceWithFreeCapacity : Resource -> InSI -> Bool
+inStockItemIsResourceWithFreeCapacity resource r =
+    r.resource == resource && inStockItemHasFreeCapacity r
+
+
+inStockItemReserveInboundOrder : Resource -> OrderId -> InSI -> InSI
+inStockItemReserveInboundOrder resource orderId r =
+    if inStockItemIsResourceWithFreeCapacity resource r then
+        { r | reservedCapacityForOrderIds = orderId :: r.reservedCapacityForOrderIds }
+
+    else
+        r
+
+
+inStockItemIsReservedForOrderId : OrderId -> InSI -> Bool
+inStockItemIsReservedForOrderId orderId r =
+    List.member orderId r.reservedCapacityForOrderIds
+
+
+inStockItemIsFilledAtCapacity : InSI -> Bool
+inStockItemIsFilledAtCapacity r =
+    r.totalCapacity == r.filledCapacity
+
+
+inStockItemUpdateOnOrderDropoff : OrderId -> InSI -> InSI
+inStockItemUpdateOnOrderDropoff orderId r =
+    if inStockItemIsReservedForOrderId orderId r then
+        { r | filledCapacity = r.filledCapacity + 1, reservedCapacityForOrderIds = LE.remove orderId r.reservedCapacityForOrderIds }
+
+    else
+        r
+
+
+type alias OutSI =
+    { totalCapacity : Int
+    , resource : Resource
+    , availableAndUnreserved : Int
+    , availableAndReservedForOrderIds : List OrderId
+    }
+
+
+initOutStockItem : Int -> Resource -> OutSI
+initOutStockItem capacity resource =
+    { totalCapacity = capacity, resource = resource, availableAndUnreserved = 0, availableAndReservedForOrderIds = [] }
+
+
+outStockItemFreeCapacity : OutSI -> Int
+outStockItemFreeCapacity r =
+    r.totalCapacity - (r.availableAndUnreserved + List.length r.availableAndReservedForOrderIds)
+
+
+outStockItemIsResource : Resource -> OutSI -> Bool
+outStockItemIsResource resource r =
+    r.resource == resource
+
+
+outStockItemIsResourceAvailableForReservation : Resource -> OutSI -> Bool
+outStockItemIsResourceAvailableForReservation resource r =
+    r.resource == resource && r.availableAndUnreserved > 0
+
+
+outStockItemIsReservedForOrderId : OrderId -> OutSI -> Bool
+outStockItemIsReservedForOrderId orderId r =
+    List.member orderId r.availableAndReservedForOrderIds
+
+
+outStockItemReserveOutboundOrder : Resource -> OrderId -> OutSI -> OutSI
+outStockItemReserveOutboundOrder resource orderId r =
+    if outStockItemIsResourceAvailableForReservation resource r then
+        { r
+            | availableAndUnreserved = r.availableAndUnreserved - 1
+            , availableAndReservedForOrderIds = orderId :: r.availableAndReservedForOrderIds
+        }
+
+    else
+        r
+
+
+outStockItemUpdateOnOrderPickup : OrderId -> OutSI -> OutSI
+outStockItemUpdateOnOrderPickup orderId r =
+    { r | availableAndReservedForOrderIds = LE.remove orderId r.availableAndReservedForOrderIds }
+
+
+type alias InStock =
+    List InSI
+
+
+type alias OutStock =
+    List OutSI
+
+
 type IO
     = In
     | Out
-
-
-type alias Stock =
-    List SI
 
 
 siIsResource resource si =
@@ -1110,98 +1259,6 @@ siAvailableQuantity si =
     si.available
 
 
-siConsume : Int -> SI -> Maybe SI
-siConsume quantity si =
-    if siAvailableQuantity si >= quantity then
-        Just { si | available = si.available - quantity }
-
-    else
-        Nothing
-
-
-siProduce : SI -> Maybe SI
-siProduce si =
-    if siFreeCapacity si > 0 then
-        Just { si | available = si.available + 1 }
-
-    else
-        Nothing
-
-
-stockPerformIO : List ResourceQuantity -> Resource -> Stock -> Maybe Stock
-stockPerformIO inputs output stock =
-    stock
-        |> stockConsumeInputs inputs
-        |> Maybe.andThen (stockStoreOutResource output)
-
-
-stockConsumeInputs : List ResourceQuantity -> Stock -> Maybe Stock
-stockConsumeInputs inputs stock =
-    inputs
-        |> List.foldl (\rq -> Maybe.andThen (stockConsumeInput rq)) (Just stock)
-
-
-stockConsumeInput : ResourceQuantity -> Stock -> Maybe Stock
-stockConsumeInput rq stock =
-    let
-        newStock =
-            updateExactlyOne (allPass [ siIsIn, siIsResource rq.resource ])
-                (\si -> si |> siConsume rq.quantity |> Maybe.withDefault si)
-                stock
-    in
-    if stock == newStock then
-        Nothing
-
-    else
-        Just newStock
-
-
-stockStoreOutResource : Resource -> Stock -> Maybe Stock
-stockStoreOutResource resource stock =
-    let
-        newStock =
-            updateExactlyOne (siIsOutResource resource)
-                (\si -> siProduce si |> Maybe.withDefault si)
-                stock
-    in
-    if stock == newStock then
-        Nothing
-
-    else
-        Just newStock
-
-
-type alias BuildingRef =
-    { id : Int, gp : GP }
-
-
-buildingStep : Int -> Building -> Building
-buildingStep _ b =
-    case producerStep b.stock b.producer of
-        Just ( stock, producer ) ->
-            { b | stock = stock, producer = producer }
-
-        Nothing ->
-            b
-
-
-buildingRequiredResources : Building -> List { required : Int, resource : Resource }
-buildingRequiredResources b =
-    b.stock
-        |> List.filter siIsIn
-        |> List.map
-            (\si ->
-                { required = siFreeCapacity si
-                , resource = si.resource
-                }
-            )
-
-
-buildingAvailableOutResource : Resource -> Building -> Maybe Int
-buildingAvailableOutResource resource b =
-    LE.find (siIsOutResource resource) b.stock |> Maybe.map .available
-
-
 siIsInResourceWithFreeCapacity resource =
     allPass [ siIsIn, siIsResource resource, siHasFreeCapacity ]
 
@@ -1222,53 +1279,258 @@ siIsInReserved orderId =
     allPass [ siIsIn, siIsReserved orderId ]
 
 
-buildingUpdateStockItem pred fn b =
-    { b | stock = updateExactlyOne pred fn b.stock }
+inStockItemConsume : Int -> InSI -> Maybe InSI
+inStockItemConsume quantity inStockItem =
+    if .filledCapacity inStockItem >= quantity then
+        Just { inStockItem | filledCapacity = inStockItem.filledCapacity - quantity }
+
+    else
+        Nothing
+
+
+outStockItemProduce : OutSI -> Maybe OutSI
+outStockItemProduce outStockItem =
+    if outStockItemFreeCapacity outStockItem > 0 then
+        Just { outStockItem | availableAndUnreserved = outStockItem.availableAndUnreserved + 1 }
+
+    else
+        Nothing
+
+
+type alias Stock =
+    List SI
+
+
+stockPerformIO : List ResourceQuantity -> Resource -> InStock -> OutStock -> Maybe { inStock : InStock, outStock : OutStock }
+stockPerformIO inputs output inStock outStock =
+    Maybe.map2 (\newInStock newOutStock -> { inStock = newInStock, outStock = newOutStock })
+        (inStockConsumeInputs inputs inStock)
+        (outStockStoreResource output outStock)
+
+
+inStockConsumeInputs : List ResourceQuantity -> InStock -> Maybe InStock
+inStockConsumeInputs inputs inStock =
+    inputs
+        |> List.foldl (\rq -> Maybe.andThen (inStockItemConsumeInput rq)) (Just inStock)
+
+
+inStockItemConsumeInput : ResourceQuantity -> InStock -> Maybe InStock
+inStockItemConsumeInput rq inStock =
+    let
+        newInStock =
+            updateExactlyOne (inStockItemIsResource rq.resource)
+                (\inStockItem -> inStockItem |> inStockItemConsume rq.quantity |> Maybe.withDefault inStockItem)
+                inStock
+    in
+    if inStock == newInStock then
+        Nothing
+
+    else
+        Just newInStock
+
+
+outStockStoreResource : Resource -> OutStock -> Maybe OutStock
+outStockStoreResource resource outStock =
+    let
+        newStock =
+            updateExactlyOne (outStockItemIsResource resource)
+                (\outStockItem -> outStockItemProduce outStockItem |> Maybe.withDefault outStockItem)
+                outStock
+    in
+    if outStock == newStock then
+        Nothing
+
+    else
+        Just newStock
+
+
+buildingStep : Int -> Building -> Building
+buildingStep _ =
+    buildingMapState
+        (\state ->
+            case state of
+                UnderConstruction r ->
+                    if List.all inStockItemIsFilledAtCapacity r.inStock then
+                        Producing r.initialProducer
+
+                    else
+                        state
+
+                Producing producer ->
+                    producerStep producer
+                        |> Maybe.map Producing
+                        |> Maybe.withDefault state
+        )
+
+
+buildingInStock : Building -> InStock
+buildingInStock b =
+    case b.state of
+        UnderConstruction r ->
+            r.inStock
+
+        Producing producer ->
+            producerInStock producer
+
+
+buildingOutStock : Building -> OutStock
+buildingOutStock b =
+    case b.state of
+        UnderConstruction r ->
+            []
+
+        Producing producer ->
+            producerOutStock producer
+
+
+buildingStockViewModel : Building -> StockViewModel
+buildingStockViewModel b =
+    List.map inStockItemViewModel (buildingInStock b)
+        ++ List.map outStockItemViewModel (buildingOutStock b)
+
+
+buildingRequiredResources : Building -> List { required : Int, resource : Resource }
+buildingRequiredResources b =
+    b |> buildingInStock |> List.map inStockItemToRequirement
+
+
+buildingAvailableOutResource : Resource -> Building -> Maybe Int
+buildingAvailableOutResource resource b =
+    case b.state of
+        UnderConstruction r ->
+            Nothing
+
+        Producing producer ->
+            producerOutStock producer
+                |> LE.find (outStockItemIsResource resource)
+                |> Maybe.map .availableAndUnreserved
+
+
+producerInStock p =
+    case p of
+        Infinite r ->
+            r.inStock
+
+        NoProduction ->
+            []
+
+
+producerOutStock p =
+    case p of
+        Infinite r ->
+            r.outStock
+
+        NoProduction ->
+            []
+
+
+producerUpdateOutStockItem pred fn p =
+    case p of
+        Infinite r ->
+            Infinite { r | outStock = updateExactlyOne pred fn r.outStock }
+
+        NoProduction ->
+            Debug.todo "why update stock in no production state"
+
+
+producerUpdateInStockItem pred fn p =
+    case p of
+        Infinite r ->
+            Infinite { r | inStock = updateExactlyOne pred fn r.inStock }
+
+        NoProduction ->
+            Debug.todo "why update stock in no production state"
+
+
+buildingMapState fn b =
+    { b | state = fn b.state }
+
+
+buildingUpdateInStockItem pred fn =
+    buildingMapState
+        (\state ->
+            case state of
+                UnderConstruction r ->
+                    UnderConstruction { r | inStock = updateExactlyOne pred fn r.inStock }
+
+                Producing producer ->
+                    Producing (producerUpdateInStockItem pred fn producer)
+        )
+
+
+buildingUpdateOutStockItem pred fn =
+    buildingMapState
+        (\state ->
+            case state of
+                UnderConstruction r ->
+                    Debug.todo "cannot update OutSI of building underconstruction"
+
+                Producing producer ->
+                    Producing (producerUpdateOutStockItem pred fn producer)
+        )
 
 
 buildingRegisterInboundOrder : Order -> Building -> Building
 buildingRegisterInboundOrder o =
-    buildingUpdateStockItem
-        (siIsInResourceWithFreeCapacity o.resource)
-        (\si -> { si | reserved = o.id :: si.reserved })
+    buildingUpdateInStockItem
+        -- (siIsInResourceWithFreeCapacity o.resource)
+        (inStockItemIsResourceWithFreeCapacity o.resource)
+        -- (\si -> { si | reserved = o.id :: si.reserved })
+        (inStockItemReserveInboundOrder o.resource o.id)
 
 
 buildingRegisterOutboundOrder : Order -> Building -> Building
 buildingRegisterOutboundOrder o =
-    buildingUpdateStockItem (siIsOutResourceAvailable o.resource)
-        (\si -> { si | available = si.available - 1, reserved = o.id :: si.reserved })
+    buildingUpdateOutStockItem
+        -- (siIsOutResourceAvailable o.resource)
+        (outStockItemIsResourceAvailableForReservation o.resource)
+        -- (\si -> { si | available = si.available - 1, reserved = o.id :: si.reserved })
+        (outStockItemReserveOutboundOrder o.resource o.id)
 
 
 buildingUpdateOnOrderPickup orderId =
-    buildingUpdateStockItem (siIsOutReserved orderId)
-        (\si -> { si | reserved = LE.remove orderId si.reserved })
+    buildingUpdateOutStockItem
+        -- (siIsOutReserved orderId)
+        (outStockItemIsReservedForOrderId orderId)
+        -- (\si -> { si | reserved = LE.remove orderId si.reserved })
+        (outStockItemUpdateOnOrderPickup orderId)
 
 
 buildingUpdateOnOrderDropoff : OrderId -> Building -> Building
 buildingUpdateOnOrderDropoff orderId =
-    buildingUpdateStockItem (siIsInReserved orderId)
-        (\si -> { si | available = si.available + 1, reserved = LE.remove orderId si.reserved })
+    buildingUpdateInStockItem
+        -- (siIsInReserved orderId)
+        (inStockItemIsReservedForOrderId orderId)
+        -- (\si -> { si | available = si.available + 1, reserved = LE.remove orderId si.reserved })
+        (inStockItemUpdateOnOrderDropoff orderId)
 
 
 buildingToRef b =
     { id = b.id, gp = b.entry }
 
 
-initialWellStock : Stock
-initialWellStock =
-    [ { io = Out, capacity = 4, available = 1, resource = Water, reserved = [] } ]
-
-
 wellWaterProducer : Producer
 wellWaterProducer =
-    Infinite { every = 12, inputs = [], output = Water, elapsed = 0 }
+    Infinite
+        { every = 12
+        , inputs = []
+        , output = Water
+        , elapsed = 0
+        , inStock = []
+        , outStock = [ initOutStockItem 4 Water ]
+        }
+
+
+wellConstructionStock : InStock
+wellConstructionStock =
+    [ initInStockItem 3 Wood ]
 
 
 b0 : Building
 b0 =
     { id = 0
-    , stock = initialWellStock
-    , producer = wellWaterProducer
+    , constructionCost = []
+    , state = Producing wellWaterProducer
     , entry = ( 2, 3 )
     , entryToCenterOffset = ( 0, 1.5 )
     , size = ( 3, 2 )
@@ -1279,8 +1541,8 @@ b0 =
 b1 : Building
 b1 =
     { id = 1
-    , stock = []
-    , producer = NoProduction
+    , constructionCost = []
+    , state = Producing NoProduction
     , entry = ( 5, 3 )
     , entryToCenterOffset = ( 0, 2 )
     , size = ( 3, 3 )
@@ -1291,9 +1553,9 @@ b1 =
 b2 : Building
 b2 =
     { id = 2
-    , stock = initialWellStock
-    , producer = wellWaterProducer
-    , entry = ( 6, 3 )
+    , constructionCost = []
+    , state = UnderConstruction { inStock = wellConstructionStock, initialProducer = wellWaterProducer }
+    , entry = ( 2, 8 )
     , entryToCenterOffset = ( 0, -1.5 )
     , size = ( 3, 2 )
     , fill = colorWater
@@ -1303,24 +1565,20 @@ b2 =
 b3 : Building
 b3 =
     let
-        demand : SI
-        demand =
-            { io = In, capacity = 3, available = 0, reserved = [], resource = Water }
-
-        supply : SI
-        supply =
-            { io = Out, capacity = 2, available = 0, reserved = [], resource = Apple }
-
         producer : Producer
         producer =
-            Infinite { every = 3, inputs = [ { resource = Water, quantity = 1 } ], output = Apple, elapsed = 0 }
+            Infinite
+                { every = 3
+                , inputs = [ { resource = Water, quantity = 1 } ]
+                , output = Apple
+                , elapsed = 0
+                , inStock = [ initInStockItem 3 Water ]
+                , outStock = [ initOutStockItem 2 Apple ]
+                }
     in
     { id = 3
-
-    -- , stock = initialWellStock
-    -- , producer = wellWaterProducer
-    , stock = [ demand, supply ]
-    , producer = producer
+    , constructionCost = []
+    , state = Producing producer
     , entry = ( 7, 6 )
     , entryToCenterOffset = ( 1.5, 0 )
     , size = ( 2, 3 )
@@ -1331,25 +1589,20 @@ b3 =
 b4 : Building
 b4 =
     let
-        demandWater : SI
-        demandWater =
-            { io = In, capacity = 3, available = 0, reserved = [], resource = Water }
-
-        demandApple : SI
-        demandApple =
-            { io = In, capacity = 3, available = 0, reserved = [], resource = Apple }
-
-        supply : SI
-        supply =
-            { io = Out, capacity = 2, available = 0, reserved = [], resource = Wood }
-
         producer : Producer
         producer =
-            Infinite { every = 3, inputs = [ { resource = Water, quantity = 1 }, { resource = Apple, quantity = 1 } ], output = Wood, elapsed = 0 }
+            Infinite
+                { every = 3
+                , inputs = [ { resource = Water, quantity = 1 }, { resource = Apple, quantity = 1 } ]
+                , output = Wood
+                , elapsed = 0
+                , inStock = [ initInStockItem 3 Water, initInStockItem 3 Apple ]
+                , outStock = [ initOutStockItem 2 Wood ]
+                }
     in
     { id = 4
-    , stock = [ demandWater, demandApple, supply ]
-    , producer = producer
+    , constructionCost = []
+    , state = Producing producer
     , entry = ( 4, 8 )
     , entryToCenterOffset = ( 0, 1.5 )
     , size = ( 3, 2 )
@@ -1387,7 +1640,7 @@ viewBuilding b =
                 , strokeWidth strokeThickness
                 , SA.rx "5"
                 ]
-            , viewStock b.stock
+            , viewStockViewModel (buildingStockViewModel b)
             ]
         , circleWithDiameter buildingEntryDiameter
             [ fill b.fill
@@ -1396,6 +1649,44 @@ viewBuilding b =
             , styleTranslate entryCenter
             ]
         ]
+
+
+type alias StockItemViewModel =
+    { io : IO, resource : Resource, stored : Int }
+
+
+inStockItemViewModel : InSI -> StockItemViewModel
+inStockItemViewModel r =
+    { io = In, resource = r.resource, stored = r.filledCapacity }
+
+
+outStockItemViewModel : OutSI -> StockItemViewModel
+outStockItemViewModel r =
+    { io = Out
+    , resource = r.resource
+    , stored = r.availableAndUnreserved + List.length r.availableAndReservedForOrderIds
+    }
+
+
+type alias StockViewModel =
+    List StockItemViewModel
+
+
+viewStockViewModel : StockViewModel -> Html msg
+viewStockViewModel stockViewModel =
+    let
+        viewStockItemViewModel i sivm =
+            let
+                string =
+                    "$IO $RESOURCE $STORED"
+                        |> String.replace "$IO" (Debug.toString sivm.io)
+                        |> String.replace "$RESOURCE" (Debug.toString sivm.resource)
+                        |> String.replace "$STORED" (Debug.toString sivm.stored)
+            in
+            group [ styleTranslate ( 0, toFloat i * cellGap ) ]
+                [ words string [ fill strokeColor, style "font-size" "13px", style "font-family" "monospace" ] ]
+    in
+    group [ styleTranslate ( 0, -cellGap * 2 ) ] (List.indexedMap viewStockItemViewModel stockViewModel)
 
 
 viewStock : Stock -> Html msg
