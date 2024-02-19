@@ -28,6 +28,7 @@ main =
 type alias Model =
     { drivers : Drivers
     , buildings : Buildings
+    , roadPosts : RoadPosts
     , step : Int
     , nextOrderId : Int
     }
@@ -37,19 +38,62 @@ init : () -> ( Model, Cmd Msg )
 init () =
     let
         _ =
-            applyN 100 updateOnTick model
+            -- applyN 100 updateOnTick model
+            1
 
         model : Model
         model =
             { drivers = initialDrivers
             , buildings = initialBuildings
+            , roadPosts = initRoadPostsFromDrivers initialDrivers
             , step = 0
             , nextOrderId = 0
             }
     in
     ( model
+        |> applyN 100 updateOnTick
     , Cmd.none
     )
+
+
+updateById x list =
+    if LE.count (idEq x.id) list == 1 then
+        Just (LE.setIf (idEq x.id) x list)
+
+    else
+        Nothing
+
+
+findById id list =
+    LE.find (idEq id) list
+
+
+idEq id =
+    .id >> eq id
+
+
+updateExactlyOneWithId id fn =
+    updateExactlyOne (.id >> eq id) fn
+
+
+updateExactlyOneWithResource resource fn =
+    updateExactlyOne (.resource >> eq resource) fn
+
+
+updateExactlyOne pred fn list =
+    let
+        _ =
+            if LE.count pred list == 1 then
+                ()
+
+            else
+                let
+                    _ =
+                        Debug.log "debug" list
+                in
+                Debug.todo "impl"
+    in
+    LE.updateIf pred fn list
 
 
 type Msg
@@ -142,6 +186,7 @@ createOrdersForContender supplier resource available { consumer, required, route
     ( available - toBeCreated, List.repeat toBeCreated (createOrder { supplier = supplier, resource = resource, consumer = consumer, route = route }) )
 
 
+createOrder : { supplier : Building, resource : Resource, consumer : Building, route : Route } -> OrderId -> Order
 createOrder { supplier, resource, consumer, route } orderId =
     let
         order : Order
@@ -154,19 +199,20 @@ createOrder { supplier, resource, consumer, route } orderId =
             , steps = steps
             }
 
+        steps : Pivot Step
         steps =
             case route of
-                ( _, [] ) ->
-                    Pivot.fromCons { from = DestBuilding from, to = DestBuilding to } []
+                ( { driver }, [] ) ->
+                    Pivot.fromCons { driverId = driver.id, from = DestBuilding from, to = DestBuilding to } []
 
                 ( firstRS, nextRS :: restRS ) ->
                     let
-                        ( lastFromDriverRef, steps_ ) =
+                        ( ( lastDriverId, lastFromDest ), inbetweenSteps ) =
                             createInbetweenSteps firstRS nextRS restRS []
                     in
-                    Pivot.fromCons { from = DestBuilding from, to = DestDriver <| createToHandoverRef firstRS nextRS }
-                        (List.map (\s -> { from = DestDriver s.from, to = DestDriver s.to }) steps_
-                            ++ [ { from = DestDriver lastFromDriverRef, to = DestBuilding to } ]
+                    Pivot.fromCons { driverId = firstRS.driver.id, from = DestBuilding from, to = createToDest firstRS nextRS }
+                        (inbetweenSteps
+                            ++ [ { driverId = lastDriverId, from = lastFromDest, to = DestBuilding to } ]
                         )
 
         ( from, to ) =
@@ -175,29 +221,37 @@ createOrder { supplier, resource, consumer, route } orderId =
     order
 
 
-createInbetweenSteps prev current rest_ acc =
-    case rest_ of
+createInbetweenSteps :
+    RouteSegment
+    -> RouteSegment
+    -> List RouteSegment
+    -> List Step
+    -> ( ( DriverId, Dest ), List Step )
+createInbetweenSteps prev current initialRest acc =
+    case initialRest of
         [] ->
-            ( createFromHandoverRef prev current, List.reverse acc )
+            ( ( current.driver.id, createFromDest prev current ), List.reverse acc )
 
-        next :: rest ->
-            createInbetweenSteps current next rest (createStep prev current next :: acc)
+        next :: newRest ->
+            createInbetweenSteps current next newRest (createStep prev current next :: acc)
 
 
+createStep : RouteSegment -> RouteSegment -> RouteSegment -> Step
 createStep p c n =
-    { from = createFromHandoverRef p c
-    , to = createToHandoverRef c n
+    { driverId = c.driver.id
+    , from = createFromDest p c
+    , to = createToDest c n
     }
 
 
-createToHandoverRef : RouteSegment -> RouteSegment -> DriverRef
-createToHandoverRef prev next =
-    { id = next.driver.id, gp = driverHandoverGPForEndPoint prev.dropGP prev.driver }
+createToDest : RouteSegment -> RouteSegment -> Dest
+createToDest prev next =
+    DestRoadPost { roadPostId = prev.dropGP, gp = driverHandoverGPForEndPoint prev.dropGP prev.driver }
 
 
-createFromHandoverRef : RouteSegment -> RouteSegment -> DriverRef
-createFromHandoverRef prev next =
-    { id = prev.driver.id, gp = driverHandoverGPForEndPoint prev.dropGP next.driver }
+createFromDest : RouteSegment -> RouteSegment -> Dest
+createFromDest prev next =
+    DestRoadPost { roadPostId = prev.dropGP, gp = driverHandoverGPForEndPoint prev.dropGP next.driver }
 
 
 type alias ResourceContenders =
@@ -380,7 +434,7 @@ mapBuildings fn model =
 
 
 updateBuildingWithId id fn =
-    mapBuildings (buildingsUpdateWithId id fn)
+    mapBuildings (updateExactlyOneWithId id fn)
 
 
 mapDrivers fn model =
@@ -388,9 +442,33 @@ mapDrivers fn model =
 
 
 updateDriverWithId id fn =
-    mapDrivers (driversUpdateWithId id fn)
+    mapDrivers (updateExactlyOneWithId id fn)
 
 
+mapRoadPosts fn model =
+    { model | roadPosts = fn model.roadPosts }
+
+
+updateRoadPostWithId id fn =
+    mapRoadPosts (updateExactlyOneWithId id fn)
+
+
+findRoadPostById : RoadPostId -> Model -> RoadPost
+findRoadPostById roadPostId model =
+    findById roadPostId model.roadPosts
+        |> ME.withDefaultLazy (\_ -> Debug.todo "roadPostId not found")
+
+
+setRoadPost : RoadPost -> Model -> Model
+setRoadPost roadPost model =
+    { model
+        | roadPosts =
+            updateById roadPost model.roadPosts
+                |> ME.withDefaultLazy (\_ -> Debug.todo "roadPost not found")
+    }
+
+
+processDriverEvent : DriverEvent -> Model -> Model
 processDriverEvent event =
     case event of
         DriverAtPickupDest o ->
@@ -398,44 +476,49 @@ processDriverEvent event =
                 DestBuilding br ->
                     updateBuildingWithId br.id (buildingUpdateOnOrderPickup o.id)
 
-                DestDriver dr ->
-                    updateDriverWithId dr.id (driverNotifyHandoverCompleted o.id)
+                DestRoadPost r ->
+                    updateRoadPostWithId r.roadPostId (roadPostNotifyOrderPickedup o.id)
 
         DriverAtDropoffDest o ->
             case orderDropOffDest o of
                 DestBuilding br ->
                     updateBuildingWithId br.id (buildingUpdateOnOrderDropoff o.id)
 
-                DestDriver dr ->
-                    updateDriverWithId dr.id (driverAssignOrder (orderUpdateNextStep o))
+                DestRoadPost r ->
+                    let
+                        updatedOrder =
+                            orderUpdateNextStep o
+                    in
+                    withRollback
+                        (tryOrderHandOffToRoadPost r.roadPostId updatedOrder
+                            >> Maybe.map
+                                (notifyDriverOfHandoffCompletion o >> handOffOrderToDriver updatedOrder)
+                        )
+
+
+tryOrderHandOffToRoadPost : RoadPostId -> Order -> Model -> Maybe Model
+tryOrderHandOffToRoadPost roadPostId order model =
+    findRoadPostById roadPostId model
+        |> roadPostTryAssignOrder order
+        |> Maybe.map (\roadPost -> setRoadPost roadPost model)
+
+
+handOffOrderToDriver : Order -> Model -> Model
+handOffOrderToDriver order =
+    updateDriverWithId (orderCurrentlyAssignedDriverId order) (driverAssignOrder order)
+
+
+notifyDriverOfHandoffCompletion : Order -> Model -> Model
+notifyDriverOfHandoffCompletion order =
+    updateDriverWithId (orderCurrentlyAssignedDriverId order) (driverNotifyHandoverCompleted order.id)
 
 
 orderUpdateNextStep o =
-    let
-        steps =
+    { o
+        | steps =
             Pivot.goR o.steps
                 |> ME.withDefaultLazy (\_ -> Debug.todo "unable to handoff no next step")
-
-        updatedOrder =
-            { o | steps = steps }
-    in
-    updatedOrder
-
-
-updateExactlyOne pred fn list =
-    let
-        _ =
-            if LE.count pred list == 1 then
-                ()
-
-            else
-                let
-                    _ =
-                        Debug.log "debug" list
-                in
-                Debug.todo "impl"
-    in
-    LE.updateIf pred fn list
+    }
 
 
 type alias GP =
@@ -476,6 +559,7 @@ view model =
                 ((allGPs |> List.map viewCellBorder)
                     ++ (model.buildings |> List.map viewBuilding)
                     ++ (model.drivers |> List.map viewDriver)
+                    ++ (model.roadPosts |> List.map viewRoadPost)
                 )
             ]
 
@@ -614,6 +698,81 @@ roadToNE (Road ne) =
 
 
 
+-- ROAD POST
+
+
+type alias RoadPost =
+    { id : GP
+    , outStock : OutStock
+    , driverOrders : Orders
+    }
+
+
+type alias RoadPostId =
+    GP
+
+
+type alias RoadPosts =
+    List RoadPost
+
+
+initRoadPost : GP -> RoadPost
+initRoadPost gp =
+    { id = gp, outStock = [], driverOrders = [] }
+
+
+initRoadPostsFromDrivers : Drivers -> RoadPosts
+initRoadPostsFromDrivers drivers =
+    drivers
+        |> List.concatMap (driverEndpoints >> tToList)
+        |> LE.unique
+        |> List.map initRoadPost
+
+
+roadPostNotifyOrderPickedup : OrderId -> RoadPost -> RoadPost
+roadPostNotifyOrderPickedup orderId rp =
+    { rp | driverOrders = List.filter (.id >> eq orderId >> not) rp.driverOrders }
+
+
+roadPostTryAssignOrder : Order -> RoadPost -> Maybe RoadPost
+roadPostTryAssignOrder o rp =
+    if List.length rp.driverOrders < 3 then
+        Just { rp | driverOrders = o :: rp.driverOrders }
+
+    else
+        Nothing
+
+
+viewRoadPost : RoadPost -> Html msg
+viewRoadPost rp =
+    group
+        [ styleTranslate (gpToWorld rp.id)
+        ]
+        [ circleWithDiameter
+            roadEndpointDiameter
+            [ stroke strokeColor
+            , fill "#333"
+            , strokeWidth strokeThickness
+            ]
+        , group []
+            (List.indexedMap (\i -> .resource >> viewResource i) rp.driverOrders)
+        ]
+
+
+viewResource : Int -> Resource -> Html msg
+viewResource i resource =
+    circleWithDiameter
+        -- driverDiameter
+        roadEndpointDiameter
+        [ stroke strokeColor
+        , (resourceColor >> fill) resource
+        , strokeWidth strokeThickness
+        , defaultTransition
+        , styleTranslate ( 0, toFloat i * (-2 * strokeThickness) )
+        ]
+
+
+
 -- ORDER
 
 
@@ -636,17 +795,31 @@ type alias Orders =
 
 
 type alias Step =
-    { from : Dest, to : Dest }
+    { driverId : DriverId, from : Dest, to : Dest }
 
 
 type Dest
     = DestBuilding BuildingRef
-    | DestDriver DriverRef
+    | DestRoadPost { roadPostId : GP, gp : GP }
+
+
+
+-- | DestRoadPost { id : GP, gp : GP }
 
 
 orderCurrentStep : Order -> Step
 orderCurrentStep o =
     Pivot.getC o.steps
+
+
+orderIsCurrentlyAssignedToDriver : DriverId -> Order -> Bool
+orderIsCurrentlyAssignedToDriver driverId o =
+    orderCurrentlyAssignedDriverId o == driverId
+
+
+orderCurrentlyAssignedDriverId : Order -> DriverId
+orderCurrentlyAssignedDriverId o =
+    o |> orderCurrentStep |> .driverId
 
 
 orderCurrentPickupGP : Order -> GP
@@ -662,7 +835,7 @@ orderCurrentDropOffGP o =
 orderShouldWaitForDropoffCompletion : Order -> Bool
 orderShouldWaitForDropoffCompletion o =
     case o |> orderCurrentStep |> .to of
-        DestDriver _ ->
+        DestRoadPost _ ->
             True
 
         DestBuilding _ ->
@@ -684,7 +857,7 @@ destGP n =
         DestBuilding { gp } ->
             gp
 
-        DestDriver { gp } ->
+        DestRoadPost { gp } ->
             gp
 
 
@@ -706,7 +879,7 @@ type alias Driver =
 
 
 type alias DriverRef =
-    { id : Int, gp : GP }
+    { id : DriverId, gp : GP }
 
 
 type DriverState
@@ -809,8 +982,8 @@ driverStep d =
         Idle ->
             ( driverProcessPendingOrders d, Nothing )
 
-        WaitingForHandover _ ->
-            ( d, Nothing )
+        WaitingForHandover o ->
+            ( d, Just (DriverAtDropoffDest o) )
 
         PickingUp o ->
             driverMoveTowards (orderCurrentPickupGP o) d
@@ -973,11 +1146,6 @@ driversFindAllServicingGP gp =
     List.filter (driverCanServeGP gp)
 
 
-driversUpdateWithId : DriverId -> (Driver -> Driver) -> Drivers -> Drivers
-driversUpdateWithId driverId fn drivers =
-    updateExactlyOne (.id >> eq driverId) fn drivers
-
-
 
 -- RESOURCE
 
@@ -1006,11 +1174,6 @@ resourceColor r =
 
 type alias Buildings =
     List Building
-
-
-buildingsUpdateWithId : BuildingId -> (Building -> Building) -> Buildings -> Buildings
-buildingsUpdateWithId buildingId fn =
-    updateExactlyOne (.id >> eq buildingId) fn
 
 
 type alias Building =
@@ -1042,7 +1205,7 @@ type alias BuildingId =
 
 
 type alias BuildingRef =
-    { id : Int, gp : GP }
+    { id : BuildingId, gp : GP }
 
 
 type BuildingState
@@ -1318,7 +1481,8 @@ inStockItemConsumeInput : ResourceQuantity -> InStock -> Maybe InStock
 inStockItemConsumeInput rq inStock =
     let
         newInStock =
-            updateExactlyOne (inStockItemIsResource rq.resource)
+            -- updateExactlyOne (inStockItemIsResource rq.resource)
+            updateExactlyOneWithResource rq.resource
                 (\inStockItem -> inStockItem |> inStockItemConsume rq.quantity |> Maybe.withDefault inStockItem)
                 inStock
     in
@@ -1333,7 +1497,8 @@ outStockStoreResource : Resource -> OutStock -> Maybe OutStock
 outStockStoreResource resource outStock =
     let
         newStock =
-            updateExactlyOne (outStockItemIsResource resource)
+            -- updateExactlyOne (outStockItemIsResource resource)
+            updateExactlyOneWithResource resource
                 (\outStockItem -> outStockItemProduce outStockItem |> Maybe.withDefault outStockItem)
                 outStock
     in
@@ -1512,7 +1677,7 @@ buildingToRef b =
 wellWaterProducer : Producer
 wellWaterProducer =
     Infinite
-        { every = 12
+        { every = 6
         , inputs = []
         , output = Water
         , elapsed = 0
