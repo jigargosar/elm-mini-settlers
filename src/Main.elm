@@ -5,6 +5,7 @@ import Browser.Events as BE
 import Html exposing (Attribute, Html, b, button, div, span, text)
 import Html.Attributes as HA exposing (class, style)
 import Html.Events as HE exposing (onClick)
+import Json.Decode as JD exposing (Decoder)
 import List.Extra as LE
 import List.Nonempty as NE
 import Maybe.Extra as ME
@@ -31,6 +32,8 @@ type alias Model =
     , roadPosts : RoadPosts
     , step : Int
     , nextOrderId : Int
+    , pointer : Float2
+    , blueprint : Building
     }
 
 
@@ -38,8 +41,7 @@ init : () -> ( Model, Cmd Msg )
 init () =
     let
         _ =
-            -- applyN 100 updateOnTick model
-            1
+            applyN 100 updateOnTick model
 
         model : Model
         model =
@@ -48,10 +50,18 @@ init () =
             , roadPosts = initRoadPostsFromDrivers initialDrivers
             , step = 0
             , nextOrderId = 0
+            , pointer = tscale 0.5 canvasSize
+            , blueprint =
+                b0
+                    |> blueprintRotate
+                    |> blueprintRotate
+                    |> blueprintRotate
+                    |> blueprintRotate
+                    |> Debug.log "debug" 
             }
     in
     ( model
-        |> applyN 100 updateOnTick
+        |> applyN 200 updateOnTick
     , Cmd.none
     )
 
@@ -98,6 +108,7 @@ updateExactlyOne pred fn list =
 
 type Msg
     = Tick
+    | PointerMoved Float2
 
 
 tickDurationInMillis =
@@ -107,16 +118,20 @@ tickDurationInMillis =
 subscriptions : Model -> Sub Msg
 subscriptions _ =
     Sub.batch
-        [ Time.every tickDurationInMillis (always Tick) ]
+        [ Time.every tickDurationInMillis (always Tick)
+        , BE.onMouseMove
+            (JD.map PointerMoved (JD.map2 Tuple.pair (JD.field "pageX" JD.float) (JD.field "pageY" JD.float)))
+        ]
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
         Tick ->
-            ( updateOnTick model
-            , Cmd.none
-            )
+            ( updateOnTick model, Cmd.none )
+
+        PointerMoved pointer ->
+            ( { model | pointer = pointer }, Cmd.none )
 
 
 updateOnTick : Model -> Model
@@ -528,9 +543,19 @@ type alias GP =
 allGPs =
     let
         ( w, h ) =
-            ( 10, 10 )
+            ( 20, 20 )
     in
     times h (\y -> times w (\x -> ( x, y )))
+        |> List.concat
+
+
+gridGPs =
+    let
+        list =
+            List.range -20 20
+    in
+    list
+        |> List.map (\y -> list |> List.map (\x -> ( x, y )))
         |> List.concat
 
 
@@ -546,25 +571,136 @@ view : Model -> Html Msg
 view model =
     div []
         [ globalStyles
-        , div [ style "padding" "10px" ]
-            [ Svg.svg
-                [ SA.viewBox "-25 -25 500 500"
+        , div [ style "display" "flex", style "flex-direction" "column", style "padding" "10px", style "gap" "10px" ]
+            [ viewSvg model
 
-                -- , style "border" "1px solid white"
-                , style "width" "500px"
-                , style "overflow" "visible"
-                , stroke "none"
-                , fill "none"
-                ]
-                ((allGPs |> List.map viewCellBorder)
-                    ++ (model.buildings |> List.map viewBuilding)
-                    ++ (model.drivers |> List.map viewDriver)
-                    ++ (model.roadPosts |> List.map viewRoadPost)
-                )
+            -- , div [ style "display" "flex", style "flex-direction" "column" ]
+            --     [ div [] [ text "steps: ", text (String.fromInt model.step) ]
+            --     , div [] [ text "pointer: ", text (Debug.toString model.pointer) ]
+            --     , div [] [ text "pointerToWorld: ", text (Debug.toString (pointerToWorld model.pointer)) ]
+            --     ]
             ]
-
-        -- , div [ style "padding" "10px" ] [ text "steps: ", text (String.fromInt model.step) ]
         ]
+
+
+viewSvg model =
+    div []
+        [ Svg.svg
+            [ viewBoxFromSizeWithOriginAtCenter canvasSize
+            , style "display" "block"
+            , style "outline" "1px solid dodgerblue"
+            , style "width" (px canvasWidth)
+            , style "height" (px canvasHeight)
+            , style "overflow" "visible"
+            , stroke "none"
+            , fill "none"
+            ]
+            [ group [ styleTranslate cameraPan, styleScale cameraZoom ]
+                (viewWorldContent model)
+            , rect canvasSize [ stroke "white", strokeWidth 1, style "stroke-dasharray" (spaced [ 50 ]) ]
+            ]
+        ]
+
+
+viewWorldContent model =
+    [ group [] []
+    , group [] (gridGPs |> List.map viewCellBorder)
+    , group []
+        ((model.buildings |> List.map viewBuilding)
+            ++ (model.drivers |> List.map viewDriver)
+            ++ (model.roadPosts |> List.map viewRoadPost)
+        )
+    , viewBlueprint model.pointer model.blueprint
+
+    -- , viewPointerIndicator model.pointer
+    -- , group [] (gridGPs |> List.map viewCellBorder)
+    , circle 10 [ fill "#fff" ]
+    ]
+
+
+spaced nums =
+    nums |> List.map String.fromFloat |> String.join " "
+
+
+cameraPan =
+    cellSize
+        |> tmap2 mul ( -5, -6 )
+        |> tscale cameraZoom
+
+
+cameraZoom =
+    1.2
+
+
+canvasSize =
+    ( 950, 600 )
+
+
+canvasWidth =
+    Tuple.first canvasSize
+
+
+canvasHeight =
+    Tuple.second canvasSize
+
+
+sizeAspectRatio ( w, h ) =
+    w / h
+
+
+sizeFromWidthAndAspectRatio w ar =
+    ( w, w / ar )
+
+
+viewBoxFromSize ( w, h ) =
+    viewBoxFromLTWH 0 0 w h
+
+
+viewBoxFromSizeWithOriginAtCenter ( w, h ) =
+    let
+        ( l, t ) =
+            ( w, h ) |> tscale -0.5
+    in
+    viewBoxFromLTWH l t w h
+
+
+viewBoxFromLTWH l t w h =
+    [ l, t, w, h ]
+        |> List.map String.fromFloat
+        |> String.join " "
+        |> SA.viewBox
+
+
+viewBlueprint pointer b =
+    let
+        entry =
+            add2 (tscale -cellDiameter b.entryToCenterOffset) (pointerToWorld pointer)
+                |> worldToGP
+    in
+    group [ style "opacity" "0.8" ] [ viewBuilding { b | entry = entry } ]
+
+
+viewPointerIndicator pointer =
+    square cellDiameter
+        [ fill colorWood
+        , style "opacity" "0.5"
+        , style "opacity" "0.8"
+        , styleTranslate (pointerToWorld pointer |> worldToNearestCellCenter)
+        ]
+
+
+canvasPageOffset =
+    ( 10, 10 )
+
+
+pointerToWorld pt =
+    pt
+        |> subBy2 (sum2 [ canvasPageOffset, tscale 0.5 canvasSize, cameraPan ])
+        |> tscale (1 / cameraZoom)
+
+
+worldToNearestCellCenter =
+    worldToGP >> gpToWorld
 
 
 
@@ -586,6 +722,10 @@ cellSize =
 
 gpToWorld gp =
     gp |> tmap toFloat |> mul2 cellSize
+
+
+worldToGP ( x, y ) =
+    ( x / cellDiameter, y / cellDiameter ) |> tmap round
 
 
 strokeColor =
@@ -641,11 +781,15 @@ colorHQGray =
 
 
 viewCellBorder gp =
-    rect
-        cellSize
-        [ stroke "#666"
-        , SA.strokeDasharray "6"
-        , styleTranslate (gpToWorld gp)
+    group
+        [ styleTranslate (gpToWorld gp)
+        ]
+        [ rect
+            cellSize
+            [ stroke "#666"
+            , SA.strokeDasharray "6"
+            ]
+        , words (Debug.toString gp) [ fill "#333", style "font-size" "13", style "font-family" "monospace" ]
         ]
 
 
@@ -876,10 +1020,6 @@ type alias Driver =
     , state : DriverState
     , pendingOrders : List Order
     }
-
-
-type alias DriverRef =
-    { id : DriverId, gp : GP }
 
 
 type DriverState
@@ -1187,19 +1327,6 @@ type alias Building =
     }
 
 
-
--- building has construction costs
--- hq doesn't have any
--- all buildings once placed start in underconstruction phase
--- all stock item are of type in
--- required, available, resource. reserved.
--- we could implement building phase, which can either store stock, or init it on change.
--- producer and stock type are closely linked, i.e. it determines in and out resources.
--- inventory capacity is the only thing independent of production.
--- we could introduce state of type construction / production with or without including stock.
--- initial state construction, then on completion, we switch to production.
-
-
 type alias BuildingId =
     Int
 
@@ -1229,6 +1356,18 @@ type alias ResourceQuantity =
     { resource : Resource, quantity : Int }
 
 
+blueprintRotate b =
+    { b | entryToCenterOffset = rotateEntryToCenterOffset b.entryToCenterOffset, size = rotateSize b.size }
+
+
+rotateEntryToCenterOffset ( x, y ) =
+    ( x, y ) |> toPolar |> Tuple.mapSecond (add (turns 0.25)) |> fromPolar
+
+
+rotateSize ( w, h ) =
+    ( h, w )
+
+
 producerStep : Producer -> Maybe Producer
 producerStep p =
     case p of
@@ -1247,16 +1386,7 @@ producerStep p =
                     )
 
 
-type alias SI =
-    { capacity : Int
-    , io : IO
-    , resource : Resource
-    , available : Int
-    , reserved : List OrderId
-    }
-
-
-type alias InSI =
+type alias InStockItem =
     { totalCapacity : Int
     , resource : Resource
     , filledCapacity : Int
@@ -1264,37 +1394,37 @@ type alias InSI =
     }
 
 
-initInStockItem : Int -> Resource -> InSI
+initInStockItem : Int -> Resource -> InStockItem
 initInStockItem capacity resource =
     { totalCapacity = capacity, resource = resource, filledCapacity = 0, reservedCapacityForOrderIds = [] }
 
 
-inStockItemToRequirement : InSI -> { required : Int, resource : Resource }
+inStockItemToRequirement : InStockItem -> { required : Int, resource : Resource }
 inStockItemToRequirement r =
     { required = inStockItemFreeCapacity r, resource = r.resource }
 
 
-inStockItemFreeCapacity : InSI -> Int
+inStockItemFreeCapacity : InStockItem -> Int
 inStockItemFreeCapacity r =
     r.totalCapacity - (r.filledCapacity + List.length r.reservedCapacityForOrderIds)
 
 
-inStockItemHasFreeCapacity : InSI -> Bool
+inStockItemHasFreeCapacity : InStockItem -> Bool
 inStockItemHasFreeCapacity r =
     inStockItemFreeCapacity r > 0
 
 
-inStockItemIsResource : Resource -> InSI -> Bool
+inStockItemIsResource : Resource -> InStockItem -> Bool
 inStockItemIsResource resource r =
     r.resource == resource
 
 
-inStockItemIsResourceWithFreeCapacity : Resource -> InSI -> Bool
+inStockItemIsResourceWithFreeCapacity : Resource -> InStockItem -> Bool
 inStockItemIsResourceWithFreeCapacity resource r =
     r.resource == resource && inStockItemHasFreeCapacity r
 
 
-inStockItemReserveInboundOrder : Resource -> OrderId -> InSI -> InSI
+inStockItemReserveInboundOrder : Resource -> OrderId -> InStockItem -> InStockItem
 inStockItemReserveInboundOrder resource orderId r =
     if inStockItemIsResourceWithFreeCapacity resource r then
         { r | reservedCapacityForOrderIds = orderId :: r.reservedCapacityForOrderIds }
@@ -1303,17 +1433,17 @@ inStockItemReserveInboundOrder resource orderId r =
         r
 
 
-inStockItemIsReservedForOrderId : OrderId -> InSI -> Bool
+inStockItemIsReservedForOrderId : OrderId -> InStockItem -> Bool
 inStockItemIsReservedForOrderId orderId r =
     List.member orderId r.reservedCapacityForOrderIds
 
 
-inStockItemIsFilledAtCapacity : InSI -> Bool
+inStockItemIsFilledAtCapacity : InStockItem -> Bool
 inStockItemIsFilledAtCapacity r =
     r.totalCapacity == r.filledCapacity
 
 
-inStockItemUpdateOnOrderDropoff : OrderId -> InSI -> InSI
+inStockItemUpdateOnOrderDropoff : OrderId -> InStockItem -> InStockItem
 inStockItemUpdateOnOrderDropoff orderId r =
     if inStockItemIsReservedForOrderId orderId r then
         { r | filledCapacity = r.filledCapacity + 1, reservedCapacityForOrderIds = LE.remove orderId r.reservedCapacityForOrderIds }
@@ -1322,7 +1452,7 @@ inStockItemUpdateOnOrderDropoff orderId r =
         r
 
 
-type alias OutSI =
+type alias OutStockItem =
     { totalCapacity : Int
     , resource : Resource
     , availableAndUnreserved : Int
@@ -1330,32 +1460,32 @@ type alias OutSI =
     }
 
 
-initOutStockItem : Int -> Resource -> OutSI
+initOutStockItem : Int -> Resource -> OutStockItem
 initOutStockItem capacity resource =
     { totalCapacity = capacity, resource = resource, availableAndUnreserved = 0, availableAndReservedForOrderIds = [] }
 
 
-outStockItemFreeCapacity : OutSI -> Int
+outStockItemFreeCapacity : OutStockItem -> Int
 outStockItemFreeCapacity r =
     r.totalCapacity - (r.availableAndUnreserved + List.length r.availableAndReservedForOrderIds)
 
 
-outStockItemIsResource : Resource -> OutSI -> Bool
+outStockItemIsResource : Resource -> OutStockItem -> Bool
 outStockItemIsResource resource r =
     r.resource == resource
 
 
-outStockItemIsResourceAvailableForReservation : Resource -> OutSI -> Bool
+outStockItemIsResourceAvailableForReservation : Resource -> OutStockItem -> Bool
 outStockItemIsResourceAvailableForReservation resource r =
     r.resource == resource && r.availableAndUnreserved > 0
 
 
-outStockItemIsReservedForOrderId : OrderId -> OutSI -> Bool
+outStockItemIsReservedForOrderId : OrderId -> OutStockItem -> Bool
 outStockItemIsReservedForOrderId orderId r =
     List.member orderId r.availableAndReservedForOrderIds
 
 
-outStockItemReserveOutboundOrder : Resource -> OrderId -> OutSI -> OutSI
+outStockItemReserveOutboundOrder : Resource -> OrderId -> OutStockItem -> OutStockItem
 outStockItemReserveOutboundOrder resource orderId r =
     if outStockItemIsResourceAvailableForReservation resource r then
         { r
@@ -1367,82 +1497,20 @@ outStockItemReserveOutboundOrder resource orderId r =
         r
 
 
-outStockItemUpdateOnOrderPickup : OrderId -> OutSI -> OutSI
+outStockItemUpdateOnOrderPickup : OrderId -> OutStockItem -> OutStockItem
 outStockItemUpdateOnOrderPickup orderId r =
     { r | availableAndReservedForOrderIds = LE.remove orderId r.availableAndReservedForOrderIds }
 
 
 type alias InStock =
-    List InSI
+    List InStockItem
 
 
 type alias OutStock =
-    List OutSI
+    List OutStockItem
 
 
-type IO
-    = In
-    | Out
-
-
-siIsResource resource si =
-    si.resource == resource
-
-
-siIsOut si =
-    si.io == Out
-
-
-siIsIn si =
-    si.io == In
-
-
-siIsOutResource resource =
-    allPass [ siIsResource resource, siIsOut ]
-
-
-allPass preds val =
-    List.map (\fn -> fn val) preds
-        |> List.foldl (&&) True
-
-
-siFreeCapacity si =
-    si.capacity - (si.available + List.length si.reserved)
-
-
-siHasFreeCapacity si =
-    siFreeCapacity si > 0
-
-
-siIsAvailable si =
-    si.available > 0
-
-
-siAvailableQuantity si =
-    si.available
-
-
-siIsInResourceWithFreeCapacity resource =
-    allPass [ siIsIn, siIsResource resource, siHasFreeCapacity ]
-
-
-siIsOutResourceAvailable resource =
-    allPass [ siIsOut, siIsResource resource, siIsAvailable ]
-
-
-siIsReserved orderId si =
-    List.member orderId si.reserved
-
-
-siIsOutReserved orderId =
-    allPass [ siIsOut, siIsReserved orderId ]
-
-
-siIsInReserved orderId =
-    allPass [ siIsIn, siIsReserved orderId ]
-
-
-inStockItemConsume : Int -> InSI -> Maybe InSI
+inStockItemConsume : Int -> InStockItem -> Maybe InStockItem
 inStockItemConsume quantity inStockItem =
     if .filledCapacity inStockItem >= quantity then
         Just { inStockItem | filledCapacity = inStockItem.filledCapacity - quantity }
@@ -1451,17 +1519,13 @@ inStockItemConsume quantity inStockItem =
         Nothing
 
 
-outStockItemProduce : OutSI -> Maybe OutSI
+outStockItemProduce : OutStockItem -> Maybe OutStockItem
 outStockItemProduce outStockItem =
     if outStockItemFreeCapacity outStockItem > 0 then
         Just { outStockItem | availableAndUnreserved = outStockItem.availableAndUnreserved + 1 }
 
     else
         Nothing
-
-
-type alias Stock =
-    List SI
 
 
 stockPerformIO : List ResourceQuantity -> Resource -> InStock -> OutStock -> Maybe { inStock : InStock, outStock : OutStock }
@@ -1628,7 +1692,7 @@ buildingUpdateOutStockItem pred fn =
         (\state ->
             case state of
                 UnderConstruction r ->
-                    Debug.todo "cannot update OutSI of building underconstruction"
+                    Debug.todo "cannot update OutStockItem of building underconstruction"
 
                 Producing producer ->
                     Producing (producerUpdateOutStockItem pred fn producer)
@@ -1638,35 +1702,27 @@ buildingUpdateOutStockItem pred fn =
 buildingRegisterInboundOrder : Order -> Building -> Building
 buildingRegisterInboundOrder o =
     buildingUpdateInStockItem
-        -- (siIsInResourceWithFreeCapacity o.resource)
         (inStockItemIsResourceWithFreeCapacity o.resource)
-        -- (\si -> { si | reserved = o.id :: si.reserved })
         (inStockItemReserveInboundOrder o.resource o.id)
 
 
 buildingRegisterOutboundOrder : Order -> Building -> Building
 buildingRegisterOutboundOrder o =
     buildingUpdateOutStockItem
-        -- (siIsOutResourceAvailable o.resource)
         (outStockItemIsResourceAvailableForReservation o.resource)
-        -- (\si -> { si | available = si.available - 1, reserved = o.id :: si.reserved })
         (outStockItemReserveOutboundOrder o.resource o.id)
 
 
 buildingUpdateOnOrderPickup orderId =
     buildingUpdateOutStockItem
-        -- (siIsOutReserved orderId)
         (outStockItemIsReservedForOrderId orderId)
-        -- (\si -> { si | reserved = LE.remove orderId si.reserved })
         (outStockItemUpdateOnOrderPickup orderId)
 
 
 buildingUpdateOnOrderDropoff : OrderId -> Building -> Building
 buildingUpdateOnOrderDropoff orderId =
     buildingUpdateInStockItem
-        -- (siIsInReserved orderId)
         (inStockItemIsReservedForOrderId orderId)
-        -- (\si -> { si | available = si.available + 1, reserved = LE.remove orderId si.reserved })
         (inStockItemUpdateOnOrderDropoff orderId)
 
 
@@ -1816,16 +1872,21 @@ viewBuilding b =
         ]
 
 
+type IO
+    = In
+    | Out
+
+
 type alias StockItemViewModel =
     { io : IO, resource : Resource, stored : Int }
 
 
-inStockItemViewModel : InSI -> StockItemViewModel
+inStockItemViewModel : InStockItem -> StockItemViewModel
 inStockItemViewModel r =
     { io = In, resource = r.resource, stored = r.filledCapacity }
 
 
-outStockItemViewModel : OutSI -> StockItemViewModel
+outStockItemViewModel : OutStockItem -> StockItemViewModel
 outStockItemViewModel r =
     { io = Out
     , resource = r.resource
@@ -1852,31 +1913,6 @@ viewStockViewModel stockViewModel =
                 [ words string [ fill strokeColor, style "font-size" "13px", style "font-family" "monospace" ] ]
     in
     group [ styleTranslate ( 0, -cellGap * 2 ) ] (List.indexedMap viewStockItemViewModel stockViewModel)
-
-
-viewStock : Stock -> Html msg
-viewStock stock =
-    let
-        viewStockItem i si =
-            let
-                stored =
-                    case si.io of
-                        In ->
-                            si.available
-
-                        Out ->
-                            si.available + List.length si.reserved
-
-                string =
-                    "$IO $RESOURCE $STORED"
-                        |> String.replace "$IO" (Debug.toString si.io)
-                        |> String.replace "$RESOURCE" (Debug.toString si.resource)
-                        |> String.replace "$STORED" (Debug.toString stored)
-            in
-            group [ styleTranslate ( 0, toFloat i * cellGap ) ]
-                [ words string [ fill strokeColor, style "font-size" "13px", style "font-family" "monospace" ] ]
-    in
-    group [ styleTranslate ( 0, -cellGap * 2 ) ] (List.indexedMap viewStockItem stock)
 
 
 
@@ -1963,6 +1999,23 @@ polyline pts attrs =
 
 
 -- BASICS
+
+
+allPass preds val =
+    List.map (\fn -> fn val) preds
+        |> List.foldl (&&) True
+
+
+sum2 =
+    List.foldl add2 ( 0, 0 )
+
+
+subBy2 =
+    tmap2 subBy
+
+
+subBy b a =
+    a - b
 
 
 applyN n fn a =
