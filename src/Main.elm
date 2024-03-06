@@ -8,6 +8,7 @@ import Html.Events as HE exposing (onClick)
 import Json.Decode as JD exposing (Decoder)
 import List.Extra as LE
 import List.Nonempty as NE
+import List.Nonempty.Extra as NEE
 import Maybe.Extra as ME
 import Pivot exposing (Pivot)
 import Search
@@ -26,44 +27,186 @@ main =
         }
 
 
+wellWaterProducer : Producer
+wellWaterProducer =
+    { every = 6
+    , inputs = []
+    , output = Water
+    , elapsed = 0
+    , inStock = []
+    , outStock = [ initOutStockItem 4 Water ]
+    }
+
+
+wellConstructionStock : InStock
+wellConstructionStock =
+    [ initInStockItem 3 Wood ]
+
+
+b0 : Building
+b0 =
+    { id = 0
+    , state = Producing wellWaterProducer
+    , entry = ( 2, 3 )
+    , entryToCenterOffset = ( 0, 1.5 )
+    , size = ( 3, 2 )
+    , fill = colorWater
+    }
+
+
+b1 : Building
+b1 =
+    { id = 1
+    , state = NoProduction
+    , entry = ( 5, 3 )
+    , entryToCenterOffset = ( 0, 2 )
+    , size = ( 3, 3 )
+    , fill = colorHQGray
+    }
+
+
+b2 : Building
+b2 =
+    { id = 2
+    , state = UnderConstruction { inStock = wellConstructionStock, initialProducer = wellWaterProducer }
+    , entry = ( 2, 8 )
+    , entryToCenterOffset = ( 0, -1.5 )
+    , size = ( 3, 2 )
+    , fill = colorWater
+    }
+
+
+b3 : Building
+b3 =
+    let
+        producer : Producer
+        producer =
+            { every = 3
+            , inputs = [ { resource = Water, quantity = 1 } ]
+            , output = Apple
+            , elapsed = 0
+            , inStock = [ initInStockItem 3 Water ]
+            , outStock = [ initOutStockItem 2 Apple ]
+            }
+    in
+    { id = 3
+    , state = Producing producer
+    , entry = ( 7, 6 )
+    , entryToCenterOffset = ( 1.5, 0 )
+    , size = ( 2, 3 )
+    , fill = colorApple
+    }
+
+
+b4 : Building
+b4 =
+    let
+        producer : Producer
+        producer =
+            { every = 3
+            , inputs = [ { resource = Water, quantity = 1 }, { resource = Apple, quantity = 1 } ]
+            , output = Wood
+            , elapsed = 0
+            , inStock = [ initInStockItem 3 Water, initInStockItem 3 Apple ]
+            , outStock = [ initOutStockItem 2 Wood ]
+            }
+    in
+    { id = 4
+    , state = Producing producer
+    , entry = ( 4, 8 )
+    , entryToCenterOffset = ( 0, 1.5 )
+    , size = ( 3, 2 )
+    , fill = colorWood
+    }
+
+
+initialBuildings : Buildings
+initialBuildings =
+    [ b0, b1, b2, b3, b4 ]
+
+
 type alias Model =
     { drivers : Drivers
+    , nextDriverId : DriverId
     , buildings : Buildings
+    , nextBuildingId : BuildingId
     , roadPosts : RoadPosts
     , step : Int
-    , nextOrderId : Int
+    , nextOrderId : OrderId
     , pointer : Float2
-    , blueprint : Building
+    , tool : Tool
     }
+
+
+type Tool
+    = PlaceBlueprint Blueprint
+    | CreateRoad (List GP)
+    | None
+
+
+type alias Blueprint =
+    Building
+
+
+type alias Buildings =
+    List Building
 
 
 init : () -> ( Model, Cmd Msg )
 init () =
     let
         _ =
-            applyN 100 updateOnTick model
+            applyN 500 updateOnTick model
 
         model : Model
         model =
             { drivers = initialDrivers
+            , nextDriverId = 200
             , buildings = initialBuildings
+            , nextBuildingId = 100
             , roadPosts = initRoadPostsFromDrivers initialDrivers
             , step = 0
             , nextOrderId = 0
-            , pointer = tscale 0.5 canvasSize
-            , blueprint =
-                b0
+            , pointer = tscale 0.5 canvasSize |> add2 canvasPageOffset
+            , tool =
+                b3
                     |> blueprintRotate
                     |> blueprintRotate
                     |> blueprintRotate
                     |> blueprintRotate
-                    |> Debug.log "debug" 
+                    -- |> Debug.log "debug"
+                    |> PlaceBlueprint
+                    |> always (CreateRoad [])
             }
     in
     ( model
-        |> applyN 200 updateOnTick
+        |> applyN 8 updateOnTick
+        |> mockDestroyBuilding
     , Cmd.none
     )
+
+
+mockDestroyBuilding : Model -> Model
+mockDestroyBuilding model =
+    case findById 3 model.buildings of
+        Nothing ->
+            model
+
+        Just b ->
+            let
+                ( removedOrders, drivers ) =
+                    model.drivers
+                        |> driversUpdateOnBuildingDestroyed b.id
+            in
+            { model
+                | drivers = drivers
+                , buildings =
+                    LE.remove b model.buildings
+                        |> List.map (buildingRemoveOrderReservationsIfAny removedOrders)
+                , roadPosts =
+                    model.roadPosts
+                        |> List.map (roadPostRemoveOrderReservationsIfAny removedOrders)
+            }
 
 
 updateById x list =
@@ -109,6 +252,8 @@ updateExactlyOne pred fn list =
 type Msg
     = Tick
     | PointerMoved Float2
+    | PointerTapped
+    | KeyDown String
 
 
 tickDurationInMillis =
@@ -119,9 +264,14 @@ subscriptions : Model -> Sub Msg
 subscriptions _ =
     Sub.batch
         [ Time.every tickDurationInMillis (always Tick)
-        , BE.onMouseMove
-            (JD.map PointerMoved (JD.map2 Tuple.pair (JD.field "pageX" JD.float) (JD.field "pageY" JD.float)))
+        , BE.onMouseMove (JD.map PointerMoved pageXYDecoder)
+        , BE.onKeyDown (JD.map KeyDown (JD.field "key" JD.string))
         ]
+
+
+pageXYDecoder : Decoder Float2
+pageXYDecoder =
+    JD.map2 Tuple.pair (JD.field "pageX" JD.float) (JD.field "pageY" JD.float)
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -131,7 +281,137 @@ update msg model =
             ( updateOnTick model, Cmd.none )
 
         PointerMoved pointer ->
-            ( { model | pointer = pointer }, Cmd.none )
+            ( { model | pointer = pointer }
+                |> updateOnPointerMoved
+            , Cmd.none
+            )
+
+        PointerTapped ->
+            case model.tool of
+                PlaceBlueprint blueprint ->
+                    ( model |> addNewBuildingFromBlueprint blueprint, Cmd.none )
+
+                CreateRoad gps ->
+                    createRoadOnPointerTap gps model
+                        |> withoutCmd
+
+                None ->
+                    ( model, Cmd.none )
+
+        KeyDown key ->
+            case key of
+                "r" ->
+                    case model.tool of
+                        PlaceBlueprint blueprint ->
+                            case key of
+                                "r" ->
+                                    ( { model | tool = blueprint |> blueprintRotate |> PlaceBlueprint }, Cmd.none )
+
+                                _ ->
+                                    ( model, Cmd.none )
+
+                        CreateRoad _ ->
+                            ( model, Cmd.none )
+
+                        None ->
+                            ( model, Cmd.none )
+
+                "q" ->
+                    ( { model | tool = CreateRoad [] }, Cmd.none )
+
+                "1" ->
+                    ( { model | tool = PlaceBlueprint b2 }, Cmd.none )
+
+                "2" ->
+                    ( { model | tool = PlaceBlueprint b3 }, Cmd.none )
+
+                "3" ->
+                    ( { model | tool = PlaceBlueprint b4 }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+
+withoutCmd model =
+    ( model, Cmd.none )
+
+
+createRoadOnPointerTap : List GP -> Model -> Model
+createRoadOnPointerTap gps model =
+    case gps of
+        [] ->
+            { model | tool = CreateRoad [ model.pointer |> pointerToGP ] }
+
+        h :: t ->
+            initRoad ( h, t )
+                |> Maybe.map
+                    (\road ->
+                        let
+                            driver =
+                                initDriver model.nextDriverId road []
+                        in
+                        { model
+                            | nextDriverId = model.nextDriverId + 1
+                            , drivers = driver :: model.drivers
+                            , tool = CreateRoad [ model.pointer |> pointerToGP ]
+                            , roadPosts =
+                                List.foldl
+                                    addNewRoadPostIfAbsent
+                                    model.roadPosts
+                                    (roadEndpoints road |> tToList)
+                        }
+                    )
+                |> Maybe.withDefault model
+
+
+updateOnPointerMoved : Model -> Model
+updateOnPointerMoved model =
+    case model.tool of
+        CreateRoad gps ->
+            let
+                gp =
+                    model.pointer |> pointerToGP
+            in
+            case gps of
+                [] ->
+                    model
+
+                h :: [] ->
+                    if areAdjcent gp h then
+                        { model | tool = CreateRoad [ gp, h ] }
+
+                    else
+                        model
+
+                h :: h2 :: t ->
+                    if gp == h2 then
+                        { model | tool = CreateRoad (h2 :: t) }
+
+                    else if areAdjcent gp h && not (List.member gp gps) && List.length gps < 7 then
+                        { model | tool = CreateRoad (gp :: gps) }
+
+                    else
+                        model
+
+        _ ->
+            model
+
+
+areAdjcent : GP -> GP -> Bool
+areAdjcent a b =
+    List.member (subBy2 a b |> tmap abs) [ ( 0, 1 ), ( 1, 0 ) ]
+
+
+addNewBuildingFromBlueprint : Blueprint -> Model -> Model
+addNewBuildingFromBlueprint blueprint model =
+    let
+        building =
+            buildingFromBlueprint model.pointer blueprint
+    in
+    { model
+        | buildings = { building | id = model.nextBuildingId } :: model.buildings
+        , nextBuildingId = 1 + model.nextBuildingId
+    }
 
 
 updateOnTick : Model -> Model
@@ -489,7 +769,7 @@ processDriverEvent event =
         DriverAtPickupDest o ->
             case orderPickupDest o of
                 DestBuilding br ->
-                    updateBuildingWithId br.id (buildingUpdateOnOrderPickup o.id)
+                    updateBuildingWithId br.id (buildingUpdateOnOrderPickup o.resource o.id)
 
                 DestRoadPost r ->
                     updateRoadPostWithId r.roadPostId (roadPostNotifyOrderPickedup o.id)
@@ -497,7 +777,7 @@ processDriverEvent event =
         DriverAtDropoffDest o ->
             case orderDropOffDest o of
                 DestBuilding br ->
-                    updateBuildingWithId br.id (buildingUpdateOnOrderDropoff o.id)
+                    updateBuildingWithId br.id (buildingUpdateOnOrderDropoff o.resource o.id)
 
                 DestRoadPost r ->
                     let
@@ -583,6 +863,7 @@ view model =
         ]
 
 
+viewSvg : Model -> Html Msg
 viewSvg model =
     div []
         [ Svg.svg
@@ -594,6 +875,8 @@ viewSvg model =
             , style "overflow" "visible"
             , stroke "none"
             , fill "none"
+            , HE.onClick PointerTapped
+            , style "user-select" "none"
             ]
             [ group [ styleTranslate cameraPan, styleScale cameraZoom ]
                 (viewWorldContent model)
@@ -602,20 +885,43 @@ viewSvg model =
         ]
 
 
+viewWorldContent : Model -> List (Svg Msg)
 viewWorldContent model =
     [ group [] []
     , group [] (gridGPs |> List.map viewCellBorder)
-    , group []
-        ((model.buildings |> List.map viewBuilding)
-            ++ (model.drivers |> List.map viewDriver)
-            ++ (model.roadPosts |> List.map viewRoadPost)
-        )
-    , viewBlueprint model.pointer model.blueprint
+    , group [] (model.buildings |> List.map viewBuilding)
+    , group [] (model.drivers |> List.map viewDriver)
+    , group [] (model.roadPosts |> List.map viewRoadPost)
+    , case model.tool of
+        PlaceBlueprint blueprint ->
+            viewBlueprint model.pointer blueprint
+
+        CreateRoad gps ->
+            viewCreateRoadTool model.pointer gps
+
+        None ->
+            group [] []
 
     -- , viewPointerIndicator model.pointer
     -- , group [] (gridGPs |> List.map viewCellBorder)
     , circle 10 [ fill "#fff" ]
     ]
+
+
+viewCreateRoadTool pointer gps =
+    case gps of
+        [] ->
+            group [ style "opacity" "0.8" ] [ viewRoadPost (initRoadPost (pointer |> pointerToGP)) ]
+
+        h :: t ->
+            let
+                roadPostGP =
+                    LE.last t |> Maybe.withDefault h
+            in
+            group []
+                [ viewRoad gps
+                , viewRoadPost (initRoadPost roadPostGP)
+                ]
 
 
 spaced nums =
@@ -672,12 +978,7 @@ viewBoxFromLTWH l t w h =
 
 
 viewBlueprint pointer b =
-    let
-        entry =
-            add2 (tscale -cellDiameter b.entryToCenterOffset) (pointerToWorld pointer)
-                |> worldToGP
-    in
-    group [ style "opacity" "0.8" ] [ viewBuilding { b | entry = entry } ]
+    group [ style "opacity" "0.8" ] [ viewBuilding (buildingFromBlueprint pointer b) ]
 
 
 viewPointerIndicator pointer =
@@ -685,7 +986,7 @@ viewPointerIndicator pointer =
         [ fill colorWood
         , style "opacity" "0.5"
         , style "opacity" "0.8"
-        , styleTranslate (pointerToWorld pointer |> worldToNearestCellCenter)
+        , styleMoveToGP (pointer |> pointerToGP)
         ]
 
 
@@ -693,14 +994,14 @@ canvasPageOffset =
     ( 10, 10 )
 
 
+pointerToGP pointer =
+    pointer |> pointerToWorld |> worldToGP
+
+
 pointerToWorld pt =
     pt
         |> subBy2 (sum2 [ canvasPageOffset, tscale 0.5 canvasSize, cameraPan ])
         |> tscale (1 / cameraZoom)
-
-
-worldToNearestCellCenter =
-    worldToGP >> gpToWorld
 
 
 
@@ -780,10 +1081,12 @@ colorHQGray =
     "#666"
 
 
+styleMoveToGP gp =
+    styleTranslate (gpToWorld gp)
+
+
 viewCellBorder gp =
-    group
-        [ styleTranslate (gpToWorld gp)
-        ]
+    group [ styleMoveToGP gp ]
         [ rect
             cellSize
             [ stroke "#666"
@@ -820,6 +1123,26 @@ type Road
     = Road (NE GP)
 
 
+initRoad : NE GP -> Maybe Road
+initRoad ne =
+    let
+        len =
+            NE.length ne
+    in
+    if
+        -- valid size
+        (clamp 4 7 len == len)
+            -- no overlap
+            && (NEE.unique ne == ne)
+            -- contineous
+            && (List.map2 areAdjcent (NE.tail ne) (NE.rest ne) |> List.all identity)
+    then
+        Just (Road ne)
+
+    else
+        Nothing
+
+
 initStraightRoad : GP -> Dir -> Int -> Road
 initStraightRoad from dir len_ =
     let
@@ -847,8 +1170,13 @@ roadToNE (Road ne) =
 
 type alias RoadPost =
     { id : GP
-    , outStock : OutStock
-    , driverOrders : Orders
+    , stockItems : List RoadPostStockItem
+    }
+
+
+type alias RoadPostStockItem =
+    { resource : Resource
+    , maybeOrderId : Maybe OrderId
     }
 
 
@@ -862,7 +1190,7 @@ type alias RoadPosts =
 
 initRoadPost : GP -> RoadPost
 initRoadPost gp =
-    { id = gp, outStock = [], driverOrders = [] }
+    { id = gp, stockItems = [] }
 
 
 initRoadPostsFromDrivers : Drivers -> RoadPosts
@@ -873,15 +1201,40 @@ initRoadPostsFromDrivers drivers =
         |> List.map initRoadPost
 
 
+addNewRoadPostIfAbsent : GP -> RoadPosts -> RoadPosts
+addNewRoadPostIfAbsent gp roadPosts =
+    if List.any (idEq gp) roadPosts then
+        roadPosts
+
+    else
+        initRoadPost gp :: roadPosts
+
+
 roadPostNotifyOrderPickedup : OrderId -> RoadPost -> RoadPost
 roadPostNotifyOrderPickedup orderId rp =
-    { rp | driverOrders = List.filter (.id >> eq orderId >> not) rp.driverOrders }
+    rp.stockItems
+        |> LE.find (.maybeOrderId >> eq (Just orderId))
+        |> Maybe.map
+            (\stockItem ->
+                { rp | stockItems = LE.remove stockItem rp.stockItems }
+            )
+        |> ME.withDefaultLazy (\_ -> Debug.todo "roadPost order not found for pickup")
+
+
+roadPostRemoveOrderReservationsIfAny : Orders -> RoadPost -> RoadPost
+roadPostRemoveOrderReservationsIfAny orders rp =
+    List.foldl roadPostRemoveOrderReservationIfAny rp orders
+
+
+roadPostRemoveOrderReservationIfAny : Order -> RoadPost -> RoadPost
+roadPostRemoveOrderReservationIfAny o rp =
+    { rp | stockItems = reject (.maybeOrderId >> eq (Just o.id)) rp.stockItems }
 
 
 roadPostTryAssignOrder : Order -> RoadPost -> Maybe RoadPost
 roadPostTryAssignOrder o rp =
-    if List.length rp.driverOrders < 3 then
-        Just { rp | driverOrders = o :: rp.driverOrders }
+    if List.length rp.stockItems < 3 then
+        Just { rp | stockItems = { resource = o.resource, maybeOrderId = Just o.id } :: rp.stockItems }
 
     else
         Nothing
@@ -889,9 +1242,7 @@ roadPostTryAssignOrder o rp =
 
 viewRoadPost : RoadPost -> Html msg
 viewRoadPost rp =
-    group
-        [ styleTranslate (gpToWorld rp.id)
-        ]
+    group [ styleMoveToGP rp.id ]
         [ circleWithDiameter
             roadEndpointDiameter
             [ stroke strokeColor
@@ -899,7 +1250,7 @@ viewRoadPost rp =
             , strokeWidth strokeThickness
             ]
         , group []
-            (List.indexedMap (\i -> .resource >> viewResource i) rp.driverOrders)
+            (List.indexedMap (\i -> .resource >> viewResource i) rp.stockItems)
         ]
 
 
@@ -949,6 +1300,11 @@ type Dest
 
 
 -- | DestRoadPost { id : GP, gp : GP }
+
+
+orderMatchesBuildingId : BuildingId -> Order -> Bool
+orderMatchesBuildingId bid o =
+    o.from.id == bid || o.to.id == bid
 
 
 orderCurrentStep : Order -> Step
@@ -1184,6 +1540,41 @@ withRollback =
     Pivot.withRollback
 
 
+driverUpdateOnBuildingDestroyed : BuildingId -> Driver -> ( Orders, Driver )
+driverUpdateOnBuildingDestroyed bid d =
+    let
+        ( removedOrders, pendingOrders ) =
+            d.pendingOrders
+                |> List.partition (orderMatchesBuildingId bid)
+    in
+    case driverCurrentOrder d |> ME.filter (orderMatchesBuildingId bid) of
+        Just currentOrder ->
+            ( currentOrder :: removedOrders
+            , { d | pendingOrders = pendingOrders, state = Idle }
+            )
+
+        Nothing ->
+            ( removedOrders
+            , { d | pendingOrders = pendingOrders }
+            )
+
+
+driverCurrentOrder : Driver -> Maybe Order
+driverCurrentOrder d =
+    case d.state of
+        Idle ->
+            Nothing
+
+        WaitingForHandover o ->
+            Just o
+
+        PickingUp o ->
+            Just o
+
+        DroppingOff o ->
+            Just o
+
+
 viewDriver : Driver -> Html Msg
 viewDriver d =
     let
@@ -1214,7 +1605,7 @@ ms n =
 
 viewVehicle gp state =
     group
-        [ styleTranslate (gpToWorld gp)
+        [ styleMoveToGP gp
         , defaultTransition
         , stroke strokeColor
         , strokeWidth strokeThickness
@@ -1261,7 +1652,7 @@ viewRoadEndpoint gp =
         [ stroke strokeColor
         , fill "#333"
         , strokeWidth strokeThickness
-        , styleTranslate (gpToWorld gp)
+        , styleMoveToGP gp
         ]
 
 
@@ -1284,6 +1675,14 @@ initialDrivers =
 driversFindAllServicingGP : GP -> Drivers -> Drivers
 driversFindAllServicingGP gp =
     List.filter (driverCanServeGP gp)
+
+
+driversUpdateOnBuildingDestroyed : BuildingId -> Drivers -> ( Orders, Drivers )
+driversUpdateOnBuildingDestroyed buildingId drivers =
+    drivers
+        |> List.map (driverUpdateOnBuildingDestroyed buildingId)
+        |> List.unzip
+        |> Tuple.mapFirst List.concat
 
 
 
@@ -1312,13 +1711,8 @@ resourceColor r =
 -- BUILDING
 
 
-type alias Buildings =
-    List Building
-
-
 type alias Building =
     { id : BuildingId
-    , constructionCost : List ResourceQuantity
     , state : BuildingState
     , entry : GP
     , entryToCenterOffset : Float2
@@ -1331,29 +1725,190 @@ type alias BuildingId =
     Int
 
 
-type alias BuildingRef =
-    { id : BuildingId, gp : GP }
+type alias ResourceQuantity =
+    { resource : Resource, quantity : Int }
 
 
 type BuildingState
     = UnderConstruction { inStock : InStock, initialProducer : Producer }
     | Producing Producer
-
-
-type Producer
-    = Infinite
-        { every : Int
-        , inputs : List ResourceQuantity
-        , output : Resource
-        , elapsed : Int
-        , inStock : InStock
-        , outStock : OutStock
-        }
     | NoProduction
 
 
-type alias ResourceQuantity =
-    { resource : Resource, quantity : Int }
+buildingStep : Int -> Building -> Building
+buildingStep _ b =
+    case buildingStepState b.state of
+        Nothing ->
+            b
+
+        Just newState ->
+            { b | state = newState }
+
+
+buildingStepState : BuildingState -> Maybe BuildingState
+buildingStepState state =
+    case state of
+        UnderConstruction r ->
+            if List.all inStockItemIsFilledAtCapacity r.inStock then
+                Just (Producing r.initialProducer)
+
+            else
+                Nothing
+
+        Producing producer ->
+            producerStep producer
+                |> Maybe.map Producing
+
+        NoProduction ->
+            Nothing
+
+
+buildingInStock : Building -> InStock
+buildingInStock b =
+    case b.state of
+        UnderConstruction r ->
+            r.inStock
+
+        Producing r ->
+            r.inStock
+
+        NoProduction ->
+            []
+
+
+buildingOutStock : Building -> OutStock
+buildingOutStock b =
+    case b.state of
+        UnderConstruction r ->
+            []
+
+        Producing r ->
+            r.outStock
+
+        NoProduction ->
+            []
+
+
+buildingRequiredResources : Building -> List { required : Int, resource : Resource }
+buildingRequiredResources b =
+    b |> buildingInStock |> List.map inStockItemToRequirement
+
+
+buildingAvailableOutResource : Resource -> Building -> Maybe Int
+buildingAvailableOutResource resource b =
+    case b.state of
+        UnderConstruction r ->
+            Nothing
+
+        Producing producer ->
+            producer.outStock
+                |> LE.find (outStockItemIsResource resource)
+                |> Maybe.map .availableAndUnreserved
+
+        NoProduction ->
+            Nothing
+
+
+buildingRemoveOrderReservationsIfAny : Orders -> Building -> Building
+buildingRemoveOrderReservationsIfAny orders b =
+    List.foldl buildingRemoveOrderReservationIfAny b orders
+
+
+buildingRemoveOrderReservationIfAny : Order -> Building -> Building
+buildingRemoveOrderReservationIfAny o b =
+    if o.from.id == b.id then
+        buildingUpdateOutStockItemWithResource o.resource
+            (outStockItemRemoveReservationIfAny o.id)
+            b
+
+    else if o.to.id == b.id then
+        buildingUpdateInStockItemWithResource o.resource
+            (inStockItemRemoveReservationIfAny o.id)
+            b
+
+    else
+        b
+
+
+buildingRegisterOutboundOrder : Order -> Building -> Building
+buildingRegisterOutboundOrder o =
+    buildingUpdateOutStockItemWithResource o.resource
+        (outStockItemReserveForOrderId o.id)
+
+
+buildingRegisterInboundOrder : Order -> Building -> Building
+buildingRegisterInboundOrder o =
+    buildingUpdateInStockItemWithResource o.resource
+        (inStockItemReserveOrder o.id)
+
+
+buildingUpdateOnOrderPickup : Resource -> OrderId -> Building -> Building
+buildingUpdateOnOrderPickup resource orderId =
+    buildingUpdateOutStockItemWithResource resource
+        (outStockItemUpdateOnOrderPickup orderId)
+
+
+buildingUpdateOnOrderDropoff : Resource -> OrderId -> Building -> Building
+buildingUpdateOnOrderDropoff resource orderId =
+    buildingUpdateInStockItemWithResource resource
+        (inStockItemUpdateOnOrderDropoff orderId)
+
+
+buildingUpdateInStockItemWithResource resource fn =
+    mapState
+        (\state ->
+            case state of
+                UnderConstruction r ->
+                    r
+                        |> mapInStock (updateExactlyOneWithResource resource fn)
+                        |> UnderConstruction
+
+                Producing r ->
+                    r
+                        |> mapInStock (updateExactlyOneWithResource resource fn)
+                        |> Producing
+
+                NoProduction ->
+                    Debug.todo "why update stock in no production state"
+        )
+
+
+buildingUpdateOutStockItemWithResource resource fn =
+    mapState
+        (\state ->
+            case state of
+                UnderConstruction r ->
+                    Debug.todo "cannot update OutStockItem of building underconstruction"
+
+                Producing r ->
+                    { r | outStock = updateExactlyOneWithResource resource fn r.outStock }
+                        |> Producing
+
+                NoProduction ->
+                    Debug.todo "why update stock in no production state"
+        )
+
+
+mapInStock fn r =
+    { r | inStock = fn r.inStock }
+
+
+mapState fn b =
+    { b | state = fn b.state }
+
+
+
+-- BLUEPRINT
+
+
+buildingFromBlueprint : Float2 -> Blueprint -> Building
+buildingFromBlueprint pointer b =
+    let
+        entry =
+            add2 (tscale -cellDiameter b.entryToCenterOffset) (pointerToWorld pointer)
+                |> worldToGP
+    in
+    { b | entry = entry }
 
 
 blueprintRotate b =
@@ -1368,22 +1923,55 @@ rotateSize ( w, h ) =
     ( h, w )
 
 
+
+-- BUILDING REF
+
+
+type alias BuildingRef =
+    { id : BuildingId, gp : GP }
+
+
+buildingToRef : Building -> BuildingRef
+buildingToRef b =
+    { id = b.id, gp = b.entry }
+
+
+
+-- PRODUCER
+
+
+type alias Producer =
+    { every : Int
+    , inputs : List ResourceQuantity
+    , output : Resource
+    , elapsed : Int
+    , inStock : InStock
+    , outStock : OutStock
+    }
+
+
 producerStep : Producer -> Maybe Producer
-producerStep p =
-    case p of
-        NoProduction ->
-            Nothing
+producerStep ({ every, inputs, output, elapsed } as r) =
+    stockPerformIO inputs output r.inStock r.outStock
+        |> Maybe.map
+            (\stock ->
+                if elapsed + 1 >= every then
+                    { r | elapsed = 0, inStock = stock.inStock, outStock = stock.outStock }
 
-        Infinite ({ every, inputs, output, elapsed } as r) ->
-            stockPerformIO inputs output r.inStock r.outStock
-                |> Maybe.map
-                    (\stock ->
-                        if elapsed + 1 >= every then
-                            Infinite { r | elapsed = 0, inStock = stock.inStock, outStock = stock.outStock }
+                else
+                    { r | elapsed = elapsed + 1 }
+            )
 
-                        else
-                            Infinite { r | elapsed = elapsed + 1 }
-                    )
+
+stockPerformIO : List ResourceQuantity -> Resource -> InStock -> OutStock -> Maybe { inStock : InStock, outStock : OutStock }
+stockPerformIO inputs output inStock outStock =
+    Maybe.map2 (\newInStock newOutStock -> { inStock = newInStock, outStock = newOutStock })
+        (inStockConsumeInputs inputs inStock)
+        (outStockStoreResource output outStock)
+
+
+
+-- IN STOCK ITEM
 
 
 type alias InStockItem =
@@ -1414,28 +2002,22 @@ inStockItemHasFreeCapacity r =
     inStockItemFreeCapacity r > 0
 
 
-inStockItemIsResource : Resource -> InStockItem -> Bool
-inStockItemIsResource resource r =
-    r.resource == resource
-
-
-inStockItemIsResourceWithFreeCapacity : Resource -> InStockItem -> Bool
-inStockItemIsResourceWithFreeCapacity resource r =
-    r.resource == resource && inStockItemHasFreeCapacity r
-
-
-inStockItemReserveInboundOrder : Resource -> OrderId -> InStockItem -> InStockItem
-inStockItemReserveInboundOrder resource orderId r =
-    if inStockItemIsResourceWithFreeCapacity resource r then
+inStockItemReserveOrder : OrderId -> InStockItem -> InStockItem
+inStockItemReserveOrder orderId r =
+    if inStockItemHasFreeCapacity r then
         { r | reservedCapacityForOrderIds = orderId :: r.reservedCapacityForOrderIds }
 
     else
+        Debug.todo "inStockItemReserveOrder failed"
+
+
+inStockItemRemoveReservationIfAny : OrderId -> InStockItem -> InStockItem
+inStockItemRemoveReservationIfAny orderId r =
+    if List.member orderId r.reservedCapacityForOrderIds then
+        { r | reservedCapacityForOrderIds = LE.remove orderId r.reservedCapacityForOrderIds }
+
+    else
         r
-
-
-inStockItemIsReservedForOrderId : OrderId -> InStockItem -> Bool
-inStockItemIsReservedForOrderId orderId r =
-    List.member orderId r.reservedCapacityForOrderIds
 
 
 inStockItemIsFilledAtCapacity : InStockItem -> Bool
@@ -1445,11 +2027,27 @@ inStockItemIsFilledAtCapacity r =
 
 inStockItemUpdateOnOrderDropoff : OrderId -> InStockItem -> InStockItem
 inStockItemUpdateOnOrderDropoff orderId r =
-    if inStockItemIsReservedForOrderId orderId r then
-        { r | filledCapacity = r.filledCapacity + 1, reservedCapacityForOrderIds = LE.remove orderId r.reservedCapacityForOrderIds }
+    if List.member orderId r.reservedCapacityForOrderIds then
+        { r
+            | filledCapacity = r.filledCapacity + 1
+            , reservedCapacityForOrderIds = LE.remove orderId r.reservedCapacityForOrderIds
+        }
 
     else
-        r
+        Debug.todo "order drop off failed: inStockItem not reserved for orderId"
+
+
+inStockItemConsume : Int -> InStockItem -> Maybe InStockItem
+inStockItemConsume quantity inStockItem =
+    if .filledCapacity inStockItem >= quantity then
+        Just { inStockItem | filledCapacity = inStockItem.filledCapacity - quantity }
+
+    else
+        Nothing
+
+
+
+-- OUT STOCK ITEM
 
 
 type alias OutStockItem =
@@ -1475,48 +2073,13 @@ outStockItemIsResource resource r =
     r.resource == resource
 
 
-outStockItemIsResourceAvailableForReservation : Resource -> OutStockItem -> Bool
-outStockItemIsResourceAvailableForReservation resource r =
-    r.resource == resource && r.availableAndUnreserved > 0
-
-
-outStockItemIsReservedForOrderId : OrderId -> OutStockItem -> Bool
-outStockItemIsReservedForOrderId orderId r =
-    List.member orderId r.availableAndReservedForOrderIds
-
-
-outStockItemReserveOutboundOrder : Resource -> OrderId -> OutStockItem -> OutStockItem
-outStockItemReserveOutboundOrder resource orderId r =
-    if outStockItemIsResourceAvailableForReservation resource r then
-        { r
-            | availableAndUnreserved = r.availableAndUnreserved - 1
-            , availableAndReservedForOrderIds = orderId :: r.availableAndReservedForOrderIds
-        }
-
-    else
-        r
-
-
 outStockItemUpdateOnOrderPickup : OrderId -> OutStockItem -> OutStockItem
 outStockItemUpdateOnOrderPickup orderId r =
-    { r | availableAndReservedForOrderIds = LE.remove orderId r.availableAndReservedForOrderIds }
-
-
-type alias InStock =
-    List InStockItem
-
-
-type alias OutStock =
-    List OutStockItem
-
-
-inStockItemConsume : Int -> InStockItem -> Maybe InStockItem
-inStockItemConsume quantity inStockItem =
-    if .filledCapacity inStockItem >= quantity then
-        Just { inStockItem | filledCapacity = inStockItem.filledCapacity - quantity }
+    if List.member orderId r.availableAndReservedForOrderIds then
+        { r | availableAndReservedForOrderIds = LE.remove orderId r.availableAndReservedForOrderIds }
 
     else
-        Nothing
+        Debug.todo "outStockItemUpdateOnOrderPickup failed"
 
 
 outStockItemProduce : OutStockItem -> Maybe OutStockItem
@@ -1528,24 +2091,45 @@ outStockItemProduce outStockItem =
         Nothing
 
 
-stockPerformIO : List ResourceQuantity -> Resource -> InStock -> OutStock -> Maybe { inStock : InStock, outStock : OutStock }
-stockPerformIO inputs output inStock outStock =
-    Maybe.map2 (\newInStock newOutStock -> { inStock = newInStock, outStock = newOutStock })
-        (inStockConsumeInputs inputs inStock)
-        (outStockStoreResource output outStock)
+outStockItemReserveForOrderId : OrderId -> OutStockItem -> OutStockItem
+outStockItemReserveForOrderId orderId r =
+    if r.availableAndUnreserved > 0 && notMember orderId r.availableAndReservedForOrderIds then
+        { r
+            | availableAndUnreserved = r.availableAndUnreserved - 1
+            , availableAndReservedForOrderIds = orderId :: r.availableAndReservedForOrderIds
+        }
+
+    else
+        Debug.todo "outStockItem reservation failed"
+
+
+outStockItemRemoveReservationIfAny : OrderId -> OutStockItem -> OutStockItem
+outStockItemRemoveReservationIfAny orderId r =
+    if List.member orderId r.availableAndReservedForOrderIds then
+        { r | availableAndReservedForOrderIds = LE.remove orderId r.availableAndReservedForOrderIds }
+
+    else
+        r
+
+
+
+-- IN STOCK
+
+
+type alias InStock =
+    List InStockItem
 
 
 inStockConsumeInputs : List ResourceQuantity -> InStock -> Maybe InStock
 inStockConsumeInputs inputs inStock =
     inputs
-        |> List.foldl (\rq -> Maybe.andThen (inStockItemConsumeInput rq)) (Just inStock)
+        |> List.foldl (\rq -> Maybe.andThen (inStockConsumeInput rq)) (Just inStock)
 
 
-inStockItemConsumeInput : ResourceQuantity -> InStock -> Maybe InStock
-inStockItemConsumeInput rq inStock =
+inStockConsumeInput : ResourceQuantity -> InStock -> Maybe InStock
+inStockConsumeInput rq inStock =
     let
         newInStock =
-            -- updateExactlyOne (inStockItemIsResource rq.resource)
             updateExactlyOneWithResource rq.resource
                 (\inStockItem -> inStockItem |> inStockItemConsume rq.quantity |> Maybe.withDefault inStockItem)
                 inStock
@@ -1557,11 +2141,18 @@ inStockItemConsumeInput rq inStock =
         Just newInStock
 
 
+
+-- OUT STOCK
+
+
+type alias OutStock =
+    List OutStockItem
+
+
 outStockStoreResource : Resource -> OutStock -> Maybe OutStock
 outStockStoreResource resource outStock =
     let
         newStock =
-            -- updateExactlyOne (outStockItemIsResource resource)
             updateExactlyOneWithResource resource
                 (\outStockItem -> outStockItemProduce outStockItem |> Maybe.withDefault outStockItem)
                 outStock
@@ -1573,267 +2164,8 @@ outStockStoreResource resource outStock =
         Just newStock
 
 
-buildingStep : Int -> Building -> Building
-buildingStep _ =
-    buildingMapState
-        (\state ->
-            case state of
-                UnderConstruction r ->
-                    if List.all inStockItemIsFilledAtCapacity r.inStock then
-                        Producing r.initialProducer
 
-                    else
-                        state
-
-                Producing producer ->
-                    producerStep producer
-                        |> Maybe.map Producing
-                        |> Maybe.withDefault state
-        )
-
-
-buildingInStock : Building -> InStock
-buildingInStock b =
-    case b.state of
-        UnderConstruction r ->
-            r.inStock
-
-        Producing producer ->
-            producerInStock producer
-
-
-buildingOutStock : Building -> OutStock
-buildingOutStock b =
-    case b.state of
-        UnderConstruction r ->
-            []
-
-        Producing producer ->
-            producerOutStock producer
-
-
-buildingStockViewModel : Building -> StockViewModel
-buildingStockViewModel b =
-    List.map inStockItemViewModel (buildingInStock b)
-        ++ List.map outStockItemViewModel (buildingOutStock b)
-
-
-buildingRequiredResources : Building -> List { required : Int, resource : Resource }
-buildingRequiredResources b =
-    b |> buildingInStock |> List.map inStockItemToRequirement
-
-
-buildingAvailableOutResource : Resource -> Building -> Maybe Int
-buildingAvailableOutResource resource b =
-    case b.state of
-        UnderConstruction r ->
-            Nothing
-
-        Producing producer ->
-            producerOutStock producer
-                |> LE.find (outStockItemIsResource resource)
-                |> Maybe.map .availableAndUnreserved
-
-
-producerInStock p =
-    case p of
-        Infinite r ->
-            r.inStock
-
-        NoProduction ->
-            []
-
-
-producerOutStock p =
-    case p of
-        Infinite r ->
-            r.outStock
-
-        NoProduction ->
-            []
-
-
-producerUpdateOutStockItem pred fn p =
-    case p of
-        Infinite r ->
-            Infinite { r | outStock = updateExactlyOne pred fn r.outStock }
-
-        NoProduction ->
-            Debug.todo "why update stock in no production state"
-
-
-producerUpdateInStockItem pred fn p =
-    case p of
-        Infinite r ->
-            Infinite { r | inStock = updateExactlyOne pred fn r.inStock }
-
-        NoProduction ->
-            Debug.todo "why update stock in no production state"
-
-
-buildingMapState fn b =
-    { b | state = fn b.state }
-
-
-buildingUpdateInStockItem pred fn =
-    buildingMapState
-        (\state ->
-            case state of
-                UnderConstruction r ->
-                    UnderConstruction { r | inStock = updateExactlyOne pred fn r.inStock }
-
-                Producing producer ->
-                    Producing (producerUpdateInStockItem pred fn producer)
-        )
-
-
-buildingUpdateOutStockItem pred fn =
-    buildingMapState
-        (\state ->
-            case state of
-                UnderConstruction r ->
-                    Debug.todo "cannot update OutStockItem of building underconstruction"
-
-                Producing producer ->
-                    Producing (producerUpdateOutStockItem pred fn producer)
-        )
-
-
-buildingRegisterInboundOrder : Order -> Building -> Building
-buildingRegisterInboundOrder o =
-    buildingUpdateInStockItem
-        (inStockItemIsResourceWithFreeCapacity o.resource)
-        (inStockItemReserveInboundOrder o.resource o.id)
-
-
-buildingRegisterOutboundOrder : Order -> Building -> Building
-buildingRegisterOutboundOrder o =
-    buildingUpdateOutStockItem
-        (outStockItemIsResourceAvailableForReservation o.resource)
-        (outStockItemReserveOutboundOrder o.resource o.id)
-
-
-buildingUpdateOnOrderPickup orderId =
-    buildingUpdateOutStockItem
-        (outStockItemIsReservedForOrderId orderId)
-        (outStockItemUpdateOnOrderPickup orderId)
-
-
-buildingUpdateOnOrderDropoff : OrderId -> Building -> Building
-buildingUpdateOnOrderDropoff orderId =
-    buildingUpdateInStockItem
-        (inStockItemIsReservedForOrderId orderId)
-        (inStockItemUpdateOnOrderDropoff orderId)
-
-
-buildingToRef b =
-    { id = b.id, gp = b.entry }
-
-
-wellWaterProducer : Producer
-wellWaterProducer =
-    Infinite
-        { every = 6
-        , inputs = []
-        , output = Water
-        , elapsed = 0
-        , inStock = []
-        , outStock = [ initOutStockItem 4 Water ]
-        }
-
-
-wellConstructionStock : InStock
-wellConstructionStock =
-    [ initInStockItem 3 Wood ]
-
-
-b0 : Building
-b0 =
-    { id = 0
-    , constructionCost = []
-    , state = Producing wellWaterProducer
-    , entry = ( 2, 3 )
-    , entryToCenterOffset = ( 0, 1.5 )
-    , size = ( 3, 2 )
-    , fill = colorWater
-    }
-
-
-b1 : Building
-b1 =
-    { id = 1
-    , constructionCost = []
-    , state = Producing NoProduction
-    , entry = ( 5, 3 )
-    , entryToCenterOffset = ( 0, 2 )
-    , size = ( 3, 3 )
-    , fill = colorHQGray
-    }
-
-
-b2 : Building
-b2 =
-    { id = 2
-    , constructionCost = []
-    , state = UnderConstruction { inStock = wellConstructionStock, initialProducer = wellWaterProducer }
-    , entry = ( 2, 8 )
-    , entryToCenterOffset = ( 0, -1.5 )
-    , size = ( 3, 2 )
-    , fill = colorWater
-    }
-
-
-b3 : Building
-b3 =
-    let
-        producer : Producer
-        producer =
-            Infinite
-                { every = 3
-                , inputs = [ { resource = Water, quantity = 1 } ]
-                , output = Apple
-                , elapsed = 0
-                , inStock = [ initInStockItem 3 Water ]
-                , outStock = [ initOutStockItem 2 Apple ]
-                }
-    in
-    { id = 3
-    , constructionCost = []
-    , state = Producing producer
-    , entry = ( 7, 6 )
-    , entryToCenterOffset = ( 1.5, 0 )
-    , size = ( 2, 3 )
-    , fill = colorApple
-    }
-
-
-b4 : Building
-b4 =
-    let
-        producer : Producer
-        producer =
-            Infinite
-                { every = 3
-                , inputs = [ { resource = Water, quantity = 1 }, { resource = Apple, quantity = 1 } ]
-                , output = Wood
-                , elapsed = 0
-                , inStock = [ initInStockItem 3 Water, initInStockItem 3 Apple ]
-                , outStock = [ initOutStockItem 2 Wood ]
-                }
-    in
-    { id = 4
-    , constructionCost = []
-    , state = Producing producer
-    , entry = ( 4, 8 )
-    , entryToCenterOffset = ( 0, 1.5 )
-    , size = ( 3, 2 )
-    , fill = colorWood
-    }
-
-
-initialBuildings : Buildings
-initialBuildings =
-    [ b0, b1, b2, b3, b4 ]
+-- BUILDING VIEW
 
 
 viewBuilding : Building -> Svg msg
@@ -1867,7 +2199,7 @@ viewBuilding b =
             [ fill b.fill
             , stroke strokeColor
             , strokeWidth strokeThickness
-            , styleTranslate entryCenter
+            , styleMoveToGP b.entry
             ]
         ]
 
@@ -1896,6 +2228,12 @@ outStockItemViewModel r =
 
 type alias StockViewModel =
     List StockItemViewModel
+
+
+buildingStockViewModel : Building -> StockViewModel
+buildingStockViewModel b =
+    List.map inStockItemViewModel (buildingInStock b)
+        ++ List.map outStockItemViewModel (buildingOutStock b)
 
 
 viewStockViewModel : StockViewModel -> Html msg
@@ -2001,6 +2339,23 @@ polyline pts attrs =
 -- BASICS
 
 
+notMember x =
+    List.member x >> not
+
+
+findExactlyOne pred list =
+    case List.filter pred list of
+        only :: [] ->
+            only
+
+        _ ->
+            Debug.todo "findExactlyOne failed"
+
+
+reject =
+    LE.filterNot
+
+
 allPass preds val =
     List.map (\fn -> fn val) preds
         |> List.foldl (&&) True
@@ -2028,6 +2383,10 @@ atLeast =
 
 atMost =
     min
+
+
+neq =
+    (/=)
 
 
 eq =
