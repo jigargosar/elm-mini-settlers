@@ -254,7 +254,7 @@ updateExactlyOne pred fn list =
 type Msg
     = Tick
     | PointerMoved Float2
-    | PointerTapped
+    | PointerTapped Float2
     | KeyDown String
 
 
@@ -268,6 +268,7 @@ subscriptions _ =
         [ Time.every tickDurationInMillis (always Tick)
         , BE.onMouseMove (JD.map PointerMoved pageXYDecoder)
         , BE.onKeyDown (JD.map KeyDown (JD.field "key" JD.string))
+        , BE.onMouseDown (JD.map PointerTapped pageXYDecoder)
         ]
 
 
@@ -288,15 +289,18 @@ update msg model =
             , Cmd.none
             )
 
-        PointerTapped ->
-            updateOnPointerTapped model
+        PointerTapped pointer ->
+            updateOnPointerTap { model | pointer = pointer }
 
         KeyDown key ->
             case key of
                 " " ->
-                    updateOnPointerTapped model
+                    updateOnPointerTap model
 
                 "`" ->
+                    ( { model | tool = None }, Cmd.none )
+
+                "Escape" ->
                     ( { model | tool = None }, Cmd.none )
 
                 "z" ->
@@ -317,20 +321,9 @@ update msg model =
                 "r" ->
                     case model.tool of
                         PlaceBlueprint blueprint ->
-                            case key of
-                                "r" ->
-                                    ( { model | tool = blueprint |> blueprintRotate |> PlaceBlueprint }, Cmd.none )
+                            ( { model | tool = blueprint |> blueprintRotate |> PlaceBlueprint }, Cmd.none )
 
-                                _ ->
-                                    ( model, Cmd.none )
-
-                        CreateRoad _ ->
-                            ( model, Cmd.none )
-
-                        Destroy ->
-                            ( model, Cmd.none )
-
-                        None ->
+                        _ ->
                             ( model, Cmd.none )
 
                 _ ->
@@ -341,13 +334,13 @@ withoutCmd model =
     ( model, Cmd.none )
 
 
-updateOnPointerTapped model =
+updateOnPointerTap model =
     case model.tool of
         PlaceBlueprint blueprint ->
             ( model |> addNewBuildingFromBlueprint blueprint, Cmd.none )
 
         CreateRoad gps ->
-            createRoadOnPointerTap gps model
+            updateCreateRoadToolOnPointerTap gps model
                 |> withoutCmd
 
         Destroy ->
@@ -421,14 +414,20 @@ destroyBuilding b model =
     }
 
 
-createRoadOnPointerTap : List GP -> Model -> Model
-createRoadOnPointerTap gps model =
+updateCreateRoadToolOnPointerTap : List GP -> Model -> Model
+updateCreateRoadToolOnPointerTap gps model =
+    let
+        pointerGP =
+            model.pointer |> pointerToGP
+    in
     case gps of
         [] ->
-            { model | tool = CreateRoad [ model.pointer |> pointerToGP ] }
+            { model | tool = CreateRoad [ pointerGP ] }
 
         h :: t ->
-            initRoad ( h, t )
+            Just ( h, t )
+                -- |> ME.filter (NE.head >> eq pointerGP)
+                |> Maybe.andThen initRoad
                 |> Maybe.map
                     (\road ->
                         let
@@ -960,7 +959,8 @@ viewSvg model =
             , style "overflow" "visible"
             , stroke "none"
             , fill "none"
-            , HE.onClick PointerTapped
+
+            -- , HE.onMouseUp PointerTapped
             , style "user-select" "none"
             ]
             [ group [ styleTranslate cameraPan, styleScale cameraZoom ]
