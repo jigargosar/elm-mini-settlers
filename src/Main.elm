@@ -170,7 +170,7 @@ init () =
             , roadPosts = initRoadPostsFromDrivers initialDrivers
             , step = 0
             , nextOrderId = 0
-            , pointer = tscale 0.5 canvasSize |> add2 canvasPageOffset
+            , pointer = tscale 0.5 initialCamera.size |> add2 canvasPageOffset
             , tool =
                 b3
                     |> blueprintRotate
@@ -951,12 +951,16 @@ view model =
 viewSvg : Model -> Html Msg
 viewSvg model =
     div []
-        [ Svg.svg
-            [ viewBoxFromSizeWithOriginAtCenter canvasSize
+        [ let
+            camera =
+                model.camera
+          in
+          Svg.svg
+            [ viewBoxFromSizeWithOriginAtCenter camera.size
             , style "display" "block"
             , style "outline" "1px solid dodgerblue"
-            , style "width" (px canvasWidth)
-            , style "height" (px canvasHeight)
+            , style "width" (px (cameraWidth camera))
+            , style "height" (px (cameraHeight camera))
             , style "overflow" "visible"
             , stroke "none"
             , fill "none"
@@ -964,9 +968,9 @@ viewSvg model =
             -- , HE.onMouseUp PointerTapped
             , style "user-select" "none"
             ]
-            [ group [ styleTranslate cameraPan, styleScale cameraZoom ]
+            [ group [ styleTranslate camera.pan, styleScale camera.zoom ]
                 (viewWorldContent model)
-            , rect canvasSize [ stroke "white", strokeWidth 1, style "stroke-dasharray" (spaced [ 50 ]) ]
+            , rect camera.size [ stroke "white", strokeWidth 1, style "stroke-dasharray" (spaced [ 50 ]) ]
             ]
         ]
 
@@ -1026,55 +1030,6 @@ viewCreateRoadTool point gps =
                 ]
 
 
-type alias Camera =
-    { pan : Float2
-    , zoom : Float
-    }
-
-
-initialCamera : Camera
-initialCamera =
-    let
-        zoom =
-            1.3
-
-        pan =
-            cellSize
-                |> mul2 ( -5, -6 )
-                |> tscale zoom
-    in
-    { pan = pan
-    , zoom = zoom
-    }
-
-
-panCamera unitDir pan =
-    pan
-        |> subBy2 (tscale cellDiameter unitDir)
-
-
-cameraPan =
-    cellSize
-        |> mul2 ( -5, -6 )
-        |> tscale cameraZoom
-
-
-cameraZoom =
-    1.3
-
-
-canvasSize =
-    ( 950, 600 )
-
-
-canvasWidth =
-    Tuple.first canvasSize
-
-
-canvasHeight =
-    Tuple.second canvasSize
-
-
 viewBoxFromSizeWithOriginAtCenter ( w, h ) =
     let
         ( l, t ) =
@@ -1104,20 +1059,6 @@ viewPointerIndicator point =
         , style "opacity" "0.8"
         , styleMoveToGP (point |> worldToGP)
         ]
-
-
-canvasPageOffset =
-    ( 10, 10 )
-
-
-pointerToGP camera pointer =
-    pointerToWorld camera pointer |> worldToGP
-
-
-pointerToWorld camera pointer =
-    pointer
-        |> subBy2 (sum2 [ canvasPageOffset, tscale 0.5 canvasSize, camera.pan ])
-        |> tscale (1 / camera.zoom)
 
 
 
@@ -1212,6 +1153,73 @@ viewCellBorder gp =
         ]
 
 
+
+-- Camera
+
+
+type alias Camera =
+    { pan : Float2
+    , zoom : Float
+    , size : Float2
+    }
+
+
+initialCamera : Camera
+initialCamera =
+    let
+        zoom =
+            1.3
+
+        pan =
+            cellSize
+                |> mul2 ( -5, -6 )
+                |> tscale zoom
+
+        size =
+            ( 950, 600 )
+    in
+    { pan = pan
+    , zoom = zoom
+    , size = size
+    }
+
+
+cameraSize =
+    .size
+
+
+cameraWidth =
+    cameraSize >> Tuple.first
+
+
+cameraHeight =
+    cameraSize >> Tuple.second
+
+
+
+-- panCamera unitDir pan =
+--     pan
+--         |> subBy2 (tscale cellDiameter unitDir)
+
+
+pointerToGP camera pointer =
+    pointerToWorld camera pointer |> worldToGP
+
+
+canvasPageOffset =
+    ( 10, 10 )
+
+
+pointerToWorld camera pointer =
+    pointer
+        |> subBy2 (sum2 [ canvasPageOffset, tscale 0.5 camera.size, camera.pan ])
+        |> tscale (1 / camera.zoom)
+
+
+
+-- DIR
+
+
 type Dir
     = Up
     | Down
@@ -1233,6 +1241,10 @@ dirToOffset dir =
 
         Right ->
             ( 1, 0 )
+
+
+
+-- ROAD
 
 
 type Road
