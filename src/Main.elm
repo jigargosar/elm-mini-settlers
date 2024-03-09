@@ -136,6 +136,7 @@ type alias Model =
     , nextOrderId : OrderId
     , pointer : Float2
     , tool : Tool
+    , camera : Camera
     }
 
 
@@ -180,6 +181,7 @@ init () =
                     |> PlaceBlueprint
                     |> always (CreateRoad [])
                     |> always Destroy
+            , camera = initialCamera
             }
     in
     ( model
@@ -354,7 +356,7 @@ destroyAtPointer : Model -> Model
 destroyAtPointer model =
     let
         gp =
-            pointerToGP model.pointer
+            pointerToGP model.camera model.pointer
     in
     model
         |> destroyDrivers (driversFindAllServicingGP gp model.drivers)
@@ -418,7 +420,7 @@ updateCreateRoadToolOnPointerTap : List GP -> Model -> Model
 updateCreateRoadToolOnPointerTap gps model =
     let
         pointerGP =
-            model.pointer |> pointerToGP
+            pointerToGP model.camera model.pointer
     in
     case gps of
         [] ->
@@ -437,7 +439,7 @@ updateCreateRoadToolOnPointerTap gps model =
                         { model
                             | nextDriverId = model.nextDriverId + 1
                             , drivers = driver :: model.drivers
-                            , tool = CreateRoad [ model.pointer |> pointerToGP ]
+                            , tool = CreateRoad [ pointerGP ]
                             , roadPosts =
                                 List.foldl
                                     addNewRoadPostIfAbsent
@@ -454,7 +456,7 @@ updateOnPointerMoved model =
         CreateRoad gps ->
             let
                 gp =
-                    model.pointer |> pointerToGP
+                    pointerToGP model.camera model.pointer
             in
             case gps of
                 [] ->
@@ -490,7 +492,7 @@ addNewBuildingFromBlueprint : Blueprint -> Model -> Model
 addNewBuildingFromBlueprint blueprint model =
     let
         building =
-            buildingFromBlueprint model.pointer blueprint
+            buildingFromBlueprintAt (pointerToWorld model.camera model.pointer) blueprint
     in
     { model
         | buildings = { building | id = model.nextBuildingId } :: model.buildings
@@ -941,7 +943,6 @@ view model =
             -- , div [ style "display" "flex", style "flex-direction" "column" ]
             --     [ div [] [ text "steps: ", text (String.fromInt model.step) ]
             --     , div [] [ text "pointer: ", text (Debug.toString model.pointer) ]
-            --     , div [] [ text "pointerToWorld: ", text (Debug.toString (pointerToWorld model.pointer)) ]
             --     ]
             ]
         ]
@@ -977,9 +978,9 @@ viewWorldContent model =
     , group [] (model.buildings |> List.map viewBuilding)
     , keyedGroup [] (model.drivers |> List.map viewKeyedDriver)
     , group [] (model.roadPosts |> List.map viewRoadPost)
-    , viewTool model.pointer model.tool
+    , viewTool (pointerToWorld model.camera model.pointer) model.tool
 
-    -- , viewPointerIndicator model.pointer
+    -- , viewPointerIndicator (pointerToWorld model.camera model.pointer)
     -- , group [] (gridGPs |> List.map viewCellBorder)
     , circle 10 [ fill "#fff" ]
     ]
@@ -989,30 +990,30 @@ keyedGroup =
     Svg.Keyed.node "g"
 
 
-viewTool pointer tool =
+viewTool point tool =
     case tool of
         PlaceBlueprint blueprint ->
-            viewBlueprint pointer blueprint
+            viewBlueprint point blueprint
 
         CreateRoad gps ->
-            viewCreateRoadTool pointer gps
+            viewCreateRoadTool point gps
 
         Destroy ->
-            viewDestroyTool pointer
+            viewDestroyTool point
 
         None ->
             group [] []
 
 
-viewDestroyTool pointer =
-    group [ styleMoveToGP (pointerToGP pointer) ]
+viewDestroyTool point =
+    group [ styleMoveToGP (worldToGP point) ]
         [ words "X" [ style "scale" "3", fill "red" ] ]
 
 
-viewCreateRoadTool pointer gps =
+viewCreateRoadTool point gps =
     case gps of
         [] ->
-            group [ style "opacity" "0.8" ] [ viewRoadPost (initRoadPost (pointer |> pointerToGP)) ]
+            group [ style "opacity" "0.8" ] [ viewRoadPost (initRoadPost (point |> worldToGP)) ]
 
         h :: t ->
             let
@@ -1025,18 +1026,41 @@ viewCreateRoadTool pointer gps =
                 ]
 
 
-spaced nums =
-    nums |> List.map String.fromFloat |> String.join " "
+type alias Camera =
+    { pan : Float2
+    , zoom : Float
+    }
+
+
+initialCamera : Camera
+initialCamera =
+    let
+        zoom =
+            1.3
+
+        pan =
+            cellSize
+                |> mul2 ( -5, -6 )
+                |> tscale zoom
+    in
+    { pan = pan
+    , zoom = zoom
+    }
+
+
+panCamera unitDir pan =
+    pan
+        |> subBy2 (tscale cellDiameter unitDir)
 
 
 cameraPan =
     cellSize
-        |> tmap2 mul ( -5, -6 )
+        |> mul2 ( -5, -6 )
         |> tscale cameraZoom
 
 
 cameraZoom =
-    1.2
+    1.3
 
 
 canvasSize =
@@ -1051,18 +1075,6 @@ canvasHeight =
     Tuple.second canvasSize
 
 
-sizeAspectRatio ( w, h ) =
-    w / h
-
-
-sizeFromWidthAndAspectRatio w ar =
-    ( w, w / ar )
-
-
-viewBoxFromSize ( w, h ) =
-    viewBoxFromLTWH 0 0 w h
-
-
 viewBoxFromSizeWithOriginAtCenter ( w, h ) =
     let
         ( l, t ) =
@@ -1073,21 +1085,24 @@ viewBoxFromSizeWithOriginAtCenter ( w, h ) =
 
 viewBoxFromLTWH l t w h =
     [ l, t, w, h ]
-        |> List.map String.fromFloat
-        |> String.join " "
+        |> spaced
         |> SA.viewBox
 
 
-viewBlueprint pointer b =
-    group [ style "opacity" "0.8" ] [ viewBuilding (buildingFromBlueprint pointer b) ]
+spaced nums =
+    nums |> List.map String.fromFloat |> String.join " "
 
 
-viewPointerIndicator pointer =
+viewBlueprint point b =
+    group [ style "opacity" "0.8" ] [ viewBuilding (buildingFromBlueprintAt point b) ]
+
+
+viewPointerIndicator point =
     square cellDiameter
         [ fill colorWood
         , style "opacity" "0.5"
         , style "opacity" "0.8"
-        , styleMoveToGP (pointer |> pointerToGP)
+        , styleMoveToGP (point |> worldToGP)
         ]
 
 
@@ -1095,14 +1110,14 @@ canvasPageOffset =
     ( 10, 10 )
 
 
-pointerToGP pointer =
-    pointer |> pointerToWorld |> worldToGP
+pointerToGP camera pointer =
+    pointerToWorld camera pointer |> worldToGP
 
 
-pointerToWorld pt =
-    pt
-        |> subBy2 (sum2 [ canvasPageOffset, tscale 0.5 canvasSize, cameraPan ])
-        |> tscale (1 / cameraZoom)
+pointerToWorld camera pointer =
+    pointer
+        |> subBy2 (sum2 [ canvasPageOffset, tscale 0.5 canvasSize, camera.pan ])
+        |> tscale (1 / camera.zoom)
 
 
 
@@ -1257,8 +1272,8 @@ initStraightRoad from dir len_ =
     Road ( from, pathRest )
 
 
-roadEndpoints (Road ( head, tail )) =
-    ( head, List.reverse tail |> List.head |> Maybe.withDefault head )
+roadEndpoints (Road ne) =
+    ( NE.head ne, NE.last ne )
 
 
 roadToNE (Road ne) =
@@ -1560,11 +1575,11 @@ type DriverEvent
     | DriverAtDropoffDest Order
 
 
-driverNotifyHandoverCompleted : Int -> Driver -> Driver
-driverNotifyHandoverCompleted id d =
+driverNotifyHandoverCompleted : OrderId -> Driver -> Driver
+driverNotifyHandoverCompleted orderId d =
     case d.state of
         WaitingForHandover o ->
-            if id == o.id then
+            if orderId == o.id then
                 driverProcessPendingOrders d
 
             else
@@ -1876,7 +1891,7 @@ buildingOccupiesGP gp b =
 
 buildingBaseOccupiesGP : GP -> Building -> Bool
 buildingBaseOccupiesGP gp b =
-    gpInSize (subBy2 (buildingLeftTopGP b) gp) b.size
+    gpIntersectsSize (subBy2 (buildingLeftTopGP b) gp) b.size
 
 
 buildingLeftTopGP : Building -> GP
@@ -1889,8 +1904,8 @@ buildingLeftTopGP b =
         |> Debug.log "debug"
 
 
-gpInSize : GP -> Int2 -> Bool
-gpInSize ( x, y ) ( w, h ) =
+gpIntersectsSize : GP -> Int2 -> Bool
+gpIntersectsSize ( x, y ) ( w, h ) =
     x >= 0 && x < w && y >= 0 && y < h
 
 
@@ -2060,11 +2075,11 @@ mapState fn b =
 -- BLUEPRINT
 
 
-buildingFromBlueprint : Float2 -> Blueprint -> Building
-buildingFromBlueprint pointer b =
+buildingFromBlueprintAt : Float2 -> Blueprint -> Building
+buildingFromBlueprintAt point b =
     let
         entry =
-            add2 (tscale -cellDiameter b.entryToCenterOffset) (pointerToWorld pointer)
+            add2 (tscale -cellDiameter b.entryToCenterOffset) point
                 |> worldToGP
     in
     { b | entry = entry }
