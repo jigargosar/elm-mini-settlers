@@ -14,6 +14,7 @@ import Pivot exposing (Pivot)
 import Search
 import Svg exposing (Svg)
 import Svg.Attributes as SA
+import Svg.Keyed
 import Time
 
 
@@ -141,6 +142,7 @@ type alias Model =
 type Tool
     = PlaceBlueprint Blueprint
     | CreateRoad (List GP)
+    | Destroy
     | None
 
 
@@ -177,13 +179,26 @@ init () =
                     -- |> Debug.log "debug"
                     |> PlaceBlueprint
                     |> always (CreateRoad [])
+                    |> always Destroy
             }
     in
     ( model
-        |> applyN 8 updateOnTick
-        |> mockDestroyBuilding
+        -- |> applyN 8 updateOnTick
+        -- |> mockDestroyBuilding
+        |> applyN 11 updateOnTick
+        |> mockDestroyDriver
     , Cmd.none
     )
+
+
+mockDestroyDriver : Model -> Model
+mockDestroyDriver model =
+    case findById 1 model.drivers of
+        Nothing ->
+            model
+
+        Just d ->
+            destroyDriver d model
 
 
 mockDestroyBuilding : Model -> Model
@@ -193,20 +208,7 @@ mockDestroyBuilding model =
             model
 
         Just b ->
-            let
-                ( removedOrders, drivers ) =
-                    model.drivers
-                        |> driversUpdateOnBuildingDestroyed b.id
-            in
-            { model
-                | drivers = drivers
-                , buildings =
-                    LE.remove b model.buildings
-                        |> List.map (buildingRemoveOrderReservationsIfAny removedOrders)
-                , roadPosts =
-                    model.roadPosts
-                        |> List.map (roadPostRemoveOrderReservationsIfAny removedOrders)
-            }
+            destroyBuilding b model
 
 
 updateById x list =
@@ -287,19 +289,31 @@ update msg model =
             )
 
         PointerTapped ->
-            case model.tool of
-                PlaceBlueprint blueprint ->
-                    ( model |> addNewBuildingFromBlueprint blueprint, Cmd.none )
-
-                CreateRoad gps ->
-                    createRoadOnPointerTap gps model
-                        |> withoutCmd
-
-                None ->
-                    ( model, Cmd.none )
+            updateOnPointerTapped model
 
         KeyDown key ->
             case key of
+                " " ->
+                    updateOnPointerTapped model
+
+                "`" ->
+                    ( { model | tool = None }, Cmd.none )
+
+                "z" ->
+                    ( { model | tool = Destroy }, Cmd.none )
+
+                "1" ->
+                    ( { model | tool = CreateRoad [] }, Cmd.none )
+
+                "2" ->
+                    ( { model | tool = PlaceBlueprint b2 }, Cmd.none )
+
+                "3" ->
+                    ( { model | tool = PlaceBlueprint b3 }, Cmd.none )
+
+                "4" ->
+                    ( { model | tool = PlaceBlueprint b4 }, Cmd.none )
+
                 "r" ->
                     case model.tool of
                         PlaceBlueprint blueprint ->
@@ -313,20 +327,11 @@ update msg model =
                         CreateRoad _ ->
                             ( model, Cmd.none )
 
-                        None ->
+                        Destroy ->
                             ( model, Cmd.none )
 
-                "q" ->
-                    ( { model | tool = CreateRoad [] }, Cmd.none )
-
-                "1" ->
-                    ( { model | tool = PlaceBlueprint b2 }, Cmd.none )
-
-                "2" ->
-                    ( { model | tool = PlaceBlueprint b3 }, Cmd.none )
-
-                "3" ->
-                    ( { model | tool = PlaceBlueprint b4 }, Cmd.none )
+                        None ->
+                            ( model, Cmd.none )
 
                 _ ->
                     ( model, Cmd.none )
@@ -334,6 +339,86 @@ update msg model =
 
 withoutCmd model =
     ( model, Cmd.none )
+
+
+updateOnPointerTapped model =
+    case model.tool of
+        PlaceBlueprint blueprint ->
+            ( model |> addNewBuildingFromBlueprint blueprint, Cmd.none )
+
+        CreateRoad gps ->
+            createRoadOnPointerTap gps model
+                |> withoutCmd
+
+        Destroy ->
+            ( destroyAtPointer model, Cmd.none )
+
+        None ->
+            ( model, Cmd.none )
+
+
+destroyAtPointer : Model -> Model
+destroyAtPointer model =
+    let
+        gp =
+            pointerToGP model.pointer
+    in
+    model
+        |> destroyDrivers (driversFindAllServicingGP gp model.drivers)
+        |> destroyBuildings (List.filter (buildingOccupiesGP gp) model.buildings)
+
+
+destroyDrivers drivers model =
+    List.foldl destroyDriver model drivers
+
+
+destroyDriver d model =
+    let
+        ( removedOrders, drivers ) =
+            model.drivers
+                |> driversUpdateOnDriverDestroyed d.id
+                |> Tuple.mapSecond (reject (idEq d.id))
+
+        roadPostIsAttachedToAnyDriver rp =
+            drivers |> List.any (driverEndpoints >> tmember rp.id)
+    in
+    { model
+        | drivers = drivers
+        , buildings =
+            model.buildings
+                |> List.map (buildingRemoveOrderReservationsIfAny removedOrders)
+        , roadPosts =
+            model.roadPosts
+                |> List.map (roadPostRemoveOrderReservationsIfAny removedOrders)
+                |> List.filter roadPostIsAttachedToAnyDriver
+    }
+
+
+tmember x ( a, b ) =
+    x == a || x == b
+
+
+destroyBuildings : Buildings -> Model -> Model
+destroyBuildings buildings model =
+    List.foldl destroyBuilding model buildings
+
+
+destroyBuilding : Building -> Model -> Model
+destroyBuilding b model =
+    let
+        ( removedOrders, drivers ) =
+            model.drivers
+                |> driversUpdateOnBuildingDestroyed b.id
+    in
+    { model
+        | drivers = drivers
+        , buildings =
+            reject (idEq b.id) model.buildings
+                |> List.map (buildingRemoveOrderReservationsIfAny removedOrders)
+        , roadPosts =
+            model.roadPosts
+                |> List.map (roadPostRemoveOrderReservationsIfAny removedOrders)
+    }
 
 
 createRoadOnPointerTap : List GP -> Model -> Model
@@ -890,22 +975,38 @@ viewWorldContent model =
     [ group [] []
     , group [] (gridGPs |> List.map viewCellBorder)
     , group [] (model.buildings |> List.map viewBuilding)
-    , group [] (model.drivers |> List.map viewDriver)
+    , keyedGroup [] (model.drivers |> List.map viewKeyedDriver)
     , group [] (model.roadPosts |> List.map viewRoadPost)
-    , case model.tool of
-        PlaceBlueprint blueprint ->
-            viewBlueprint model.pointer blueprint
-
-        CreateRoad gps ->
-            viewCreateRoadTool model.pointer gps
-
-        None ->
-            group [] []
+    , viewTool model.pointer model.tool
 
     -- , viewPointerIndicator model.pointer
     -- , group [] (gridGPs |> List.map viewCellBorder)
     , circle 10 [ fill "#fff" ]
     ]
+
+
+keyedGroup =
+    Svg.Keyed.node "g"
+
+
+viewTool pointer tool =
+    case tool of
+        PlaceBlueprint blueprint ->
+            viewBlueprint pointer blueprint
+
+        CreateRoad gps ->
+            viewCreateRoadTool pointer gps
+
+        Destroy ->
+            viewDestroyTool pointer
+
+        None ->
+            group [] []
+
+
+viewDestroyTool pointer =
+    group [ styleMoveToGP (pointerToGP pointer) ]
+        [ words "X" [ style "scale" "3", fill "red" ] ]
 
 
 viewCreateRoadTool pointer gps =
@@ -1307,14 +1408,15 @@ orderMatchesBuildingId bid o =
     o.from.id == bid || o.to.id == bid
 
 
+orderMayBeAssignedToDriver : DriverId -> Order -> Bool
+orderMayBeAssignedToDriver driverId o =
+    (Pivot.getC o.steps :: Pivot.getR o.steps)
+        |> List.any (.driverId >> eq driverId)
+
+
 orderCurrentStep : Order -> Step
 orderCurrentStep o =
     Pivot.getC o.steps
-
-
-orderIsCurrentlyAssignedToDriver : DriverId -> Order -> Bool
-orderIsCurrentlyAssignedToDriver driverId o =
-    orderCurrentlyAssignedDriverId o == driverId
 
 
 orderCurrentlyAssignedDriverId : Order -> DriverId
@@ -1540,6 +1642,25 @@ withRollback =
     Pivot.withRollback
 
 
+driverUpdateOnDriverDestroyed : DriverId -> Driver -> ( Orders, Driver )
+driverUpdateOnDriverDestroyed driverId d =
+    let
+        ( removedOrders, pendingOrders ) =
+            d.pendingOrders
+                |> List.partition (orderMayBeAssignedToDriver driverId)
+    in
+    case driverCurrentOrder d |> ME.filter (orderMayBeAssignedToDriver driverId) of
+        Just currentOrder ->
+            ( currentOrder :: removedOrders
+            , { d | pendingOrders = pendingOrders, state = Idle }
+            )
+
+        Nothing ->
+            ( removedOrders
+            , { d | pendingOrders = pendingOrders }
+            )
+
+
 driverUpdateOnBuildingDestroyed : BuildingId -> Driver -> ( Orders, Driver )
 driverUpdateOnBuildingDestroyed bid d =
     let
@@ -1573,6 +1694,11 @@ driverCurrentOrder d =
 
         DroppingOff o ->
             Just o
+
+
+viewKeyedDriver : Driver -> ( String, Html Msg )
+viewKeyedDriver d =
+    ( String.fromInt d.id, viewDriver d )
 
 
 viewDriver : Driver -> Html Msg
@@ -1677,6 +1803,14 @@ driversFindAllServicingGP gp =
     List.filter (driverCanServeGP gp)
 
 
+driversUpdateOnDriverDestroyed : DriverId -> Drivers -> ( Orders, Drivers )
+driversUpdateOnDriverDestroyed driverId drivers =
+    drivers
+        |> List.map (driverUpdateOnDriverDestroyed driverId)
+        |> List.unzip
+        |> Tuple.mapFirst List.concat
+
+
 driversUpdateOnBuildingDestroyed : BuildingId -> Drivers -> ( Orders, Drivers )
 driversUpdateOnBuildingDestroyed buildingId drivers =
     drivers
@@ -1733,6 +1867,31 @@ type BuildingState
     = UnderConstruction { inStock : InStock, initialProducer : Producer }
     | Producing Producer
     | NoProduction
+
+
+buildingOccupiesGP : GP -> Building -> Bool
+buildingOccupiesGP gp b =
+    b.entry == gp || buildingBaseOccupiesGP gp b
+
+
+buildingBaseOccupiesGP : GP -> Building -> Bool
+buildingBaseOccupiesGP gp b =
+    gpInSize (subBy2 (buildingLeftTopGP b) gp) b.size
+
+
+buildingLeftTopGP : Building -> GP
+buildingLeftTopGP b =
+    tmap toFloat b.entry
+        -- |> subBy2 b.entryToCenterOffset
+        |> add2 b.entryToCenterOffset
+        |> subBy2 (tmap (toFloat >> mul 0.5) b.size)
+        |> tmap round
+        |> Debug.log "debug"
+
+
+gpInSize : GP -> Int2 -> Bool
+gpInSize ( x, y ) ( w, h ) =
+    x >= 0 && x < w && y >= 0 && y < h
 
 
 buildingStep : Int -> Building -> Building
@@ -2201,6 +2360,9 @@ viewBuilding b =
             , strokeWidth strokeThickness
             , styleMoveToGP b.entry
             ]
+
+        -- , group [ styleMoveToGP (buildingLeftTopGP b) ]
+        --     [ words "LT" [ fill "red" ] ]
         ]
 
 
