@@ -30,7 +30,7 @@ main =
 
 wellWaterProducer : Producer
 wellWaterProducer =
-    { every = 6
+    { every = 1200 // tickDurationInMillis
     , inputs = []
     , output = Water
     , elapsed = 0
@@ -187,7 +187,7 @@ init () =
     ( model
         -- |> applyN 8 updateOnTick
         -- |> mockDestroyBuilding
-        |> applyN 11 updateOnTick
+        -- |> applyN 11 updateOnTick
         |> mockDestroyDriver
     , Cmd.none
     )
@@ -296,6 +296,24 @@ update msg model =
 
         KeyDown key ->
             case key of
+                "q" ->
+                    ( zoomIn model, Cmd.none )
+
+                "e" ->
+                    ( zoomOut model, Cmd.none )
+
+                "w" ->
+                    ( pan Up model, Cmd.none )
+
+                "s" ->
+                    ( pan Down model, Cmd.none )
+
+                "a" ->
+                    ( pan Left model, Cmd.none )
+
+                "d" ->
+                    ( pan Right model, Cmd.none )
+
                 " " ->
                     updateOnPointerTap model
 
@@ -330,6 +348,18 @@ update msg model =
 
                 _ ->
                     ( model, Cmd.none )
+
+
+pan dir model =
+    { model | camera = cameraPan dir model.camera }
+
+
+zoomIn model =
+    { model | camera = cameraZoomIn model.camera }
+
+
+zoomOut model =
+    { model | camera = cameraZoomOut model.camera }
 
 
 withoutCmd model =
@@ -937,7 +967,12 @@ view : Model -> Html Msg
 view model =
     div []
         [ globalStyles
-        , div [ style "display" "flex", style "flex-direction" "column", style "padding" "10px", style "gap" "10px" ]
+        , div
+            [ style "display" "flex"
+            , style "flex-direction" "column"
+            , style "padding" "10px"
+            , style "gap" "10px"
+            ]
             [ viewSvg model
 
             -- , div [ style "display" "flex", style "flex-direction" "column" ]
@@ -957,10 +992,16 @@ viewSvg model =
           in
           Svg.svg
             [ viewBoxFromSizeWithOriginAtCenter camera.size
+            , SA.id "main-camera"
             , style "display" "block"
             , style "outline" "1px solid dodgerblue"
             , style "width" (px (cameraWidth camera))
             , style "height" (px (cameraHeight camera))
+
+            -- , style "position" "fixed"
+            -- , style "inset" "0"
+            -- , style "width" "100%"
+            -- , style "height" "100%"
             , style "overflow" "visible"
             , stroke "none"
             , fill "none"
@@ -970,7 +1011,7 @@ viewSvg model =
             ]
             [ group [ styleTranslate camera.pan, styleScale camera.zoom ]
                 (viewWorldContent model)
-            , rect camera.size [ stroke "white", strokeWidth 1, style "stroke-dasharray" (spaced [ 50 ]) ]
+            , rect camera.size [ stroke "red", strokeWidth 1, style "stroke-dasharray" (spaced [ 50 ]) ]
             ]
         ]
 
@@ -1170,7 +1211,7 @@ initialCamera =
         zoom =
             1.3
 
-        pan =
+        pan_ =
             cellSize
                 |> mul2 ( -5, -6 )
                 |> tscale zoom
@@ -1178,7 +1219,7 @@ initialCamera =
         size =
             ( 950, 600 )
     in
-    { pan = pan
+    { pan = pan_
     , zoom = zoom
     , size = size
     }
@@ -1196,10 +1237,41 @@ cameraHeight =
     cameraSize >> Tuple.second
 
 
+cameraZoomIn =
+    cameraZoom 1
 
--- panCamera unitDir pan =
---     pan
---         |> subBy2 (tscale cellDiameter unitDir)
+
+cameraZoomOut =
+    cameraZoom -1
+
+
+cameraZoom zoomDir camera =
+    let
+        newZoom =
+            (camera.zoom + zoomDir * 0.2 * camera.zoom)
+                |> clamp 0.2 4
+    in
+    { camera
+        | zoom = newZoom
+        , pan = tscale (1 / camera.zoom) camera.pan |> tscale newZoom
+    }
+
+
+cameraPan dir camera =
+    let
+        dirVector =
+            dirToUnitVector dir
+                |> tmap negate
+
+        panOffset =
+            mul2 dirVector cellSize
+                |> tscale camera.zoom
+
+        newPan =
+            camera.pan
+                |> add2 panOffset
+    in
+    { camera | pan = newPan }
 
 
 pointerToGP camera pointer =
@@ -1227,8 +1299,23 @@ type Dir
     | Right
 
 
-dirToOffset : Dir -> Int2
+dirToOffset : Dir -> ( number, number )
 dirToOffset dir =
+    case dir of
+        Up ->
+            ( 0, -1 )
+
+        Down ->
+            ( 0, 1 )
+
+        Left ->
+            ( -1, 0 )
+
+        Right ->
+            ( 1, 0 )
+
+
+dirToUnitVector dir =
     case dir of
         Up ->
             ( 0, -1 )
@@ -1633,12 +1720,22 @@ driverStep d =
 
 driverProcessPendingOrders : Driver -> Driver
 driverProcessPendingOrders d =
-    case d.pendingOrders of
-        o :: pendingOrders ->
-            { d | state = PickingUp o, pendingOrders = pendingOrders }
+    d.pendingOrders
+        |> LE.find (orderCurrentPickupGP >> eq (driverCurrentGP d))
+        |> Maybe.map
+            (\o ->
+                { d | state = PickingUp o, pendingOrders = reject (idEq o.id) d.pendingOrders }
+            )
+        -- |> always Nothing
+        |> ME.withDefaultLazy
+            (\_ ->
+                case d.pendingOrders of
+                    o :: pendingOrders ->
+                        { d | state = PickingUp o, pendingOrders = pendingOrders }
 
-        [] ->
-            { d | state = Idle }
+                    [] ->
+                        { d | state = Idle }
+            )
 
 
 driverMoveTowards : GP -> Driver -> Maybe ( Driver, Maybe DriverEvent )
