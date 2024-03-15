@@ -28,9 +28,17 @@ main =
         }
 
 
+everyMilli milli =
+    milli // tickDurationInMillis
+
+
+everySecond sec =
+    sec * 1000 |> everyMilli
+
+
 wellWaterProducer : Producer
 wellWaterProducer =
-    { every = 1200 // tickDurationInMillis
+    { every = everySecond 5
     , inputs = []
     , output = Water
     , elapsed = 0
@@ -57,8 +65,19 @@ b0 =
 
 b1 : Building
 b1 =
+    let
+        producer : Producer
+        producer =
+            { every = everySecond 15
+            , inputs = []
+            , output = Wood
+            , elapsed = 0
+            , inStock = []
+            , outStock = [ initFilledOutStockItem 3 Wood ]
+            }
+    in
     { id = 1
-    , state = NoProduction
+    , state = Producing producer
     , entry = ( 5, 3 )
     , entryToCenterOffset = ( 0, 2 )
     , size = ( 3, 3 )
@@ -105,11 +124,11 @@ b4 =
         producer : Producer
         producer =
             { every = 3
-            , inputs = [ { resource = Water, quantity = 1 }, { resource = Apple, quantity = 1 } ]
+            , inputs = [ { resource = Apple, quantity = 1 } ]
             , output = Wood
             , elapsed = 0
-            , inStock = [ initInStockItem 3 Water, initInStockItem 3 Apple ]
-            , outStock = [ initOutStockItem 2 Wood ]
+            , inStock = [ initInStockItem 3 Apple ]
+            , outStock = [ initOutStockItem 4 Wood ]
             }
     in
     { id = 4
@@ -185,10 +204,10 @@ init () =
             }
     in
     ( model
-        -- |> applyN 8 updateOnTick
-        -- |> mockDestroyBuilding
-        -- |> applyN 11 updateOnTick
-        |> mockDestroyDriver
+      -- |> applyN 8 updateOnTick
+      -- |> mockDestroyBuilding
+      -- |> applyN 11 updateOnTick
+      -- |> mockDestroyDriver
     , Cmd.none
     )
 
@@ -594,12 +613,15 @@ createOrdersForContender supplier resource available { consumer, required, route
         toBeCreated =
             required |> atMost available
     in
-    ( available - toBeCreated, List.repeat toBeCreated (createOrder { supplier = supplier, resource = resource, consumer = consumer, route = route }) )
+    ( available - toBeCreated, List.repeat toBeCreated (createOrder { supplier = buildingToRef supplier, resource = resource, consumer = buildingToRef consumer, route = route }) )
 
 
-createOrder : { supplier : Building, resource : Resource, consumer : Building, route : Route } -> OrderId -> Order
+createOrder : { supplier : BuildingRef, resource : Resource, consumer : BuildingRef, route : Route } -> OrderId -> Order
 createOrder { supplier, resource, consumer, route } orderId =
     let
+        ( from, to ) =
+            ( supplier, consumer )
+
         order : Order
         order =
             { id = orderId
@@ -625,9 +647,6 @@ createOrder { supplier, resource, consumer, route } orderId =
                         (inbetweenSteps
                             ++ [ { driverId = lastDriverId, from = lastFromDest, to = DestBuilding to } ]
                         )
-
-        ( from, to ) =
-            ( supplier, consumer ) |> tmap buildingToRef
     in
     order
 
@@ -717,37 +736,30 @@ type alias Request =
 assembleRequests : Model -> List Request
 assembleRequests model =
     model.buildings
-        |> List.concatMap
-            (\consumer ->
-                consumer
-                    |> buildingRequiredResources
-                    |> List.filterMap
-                        (\requirement ->
-                            findShortestPathToSupplier requirement consumer model
-                        )
-            )
+        |> List.concatMap buildingToConsumers
+        |> List.filterMap (findShortestPathToSupplier model)
 
 
-findShortestPathToSupplier : { required : Int, resource : Resource } -> Building -> Model -> Maybe Request
-findShortestPathToSupplier { required, resource } consumer model =
+findShortestPathToSupplier : Model -> Consumer -> Maybe Request
+findShortestPathToSupplier model consumer =
     let
         result =
             model.drivers
-                |> driversFindAllServicingGP consumer.entry
-                |> List.map (\d -> { driver = d, dropGP = consumer.entry })
-                |> List.map (initSearchState consumer resource model.buildings [])
-                |> Search.uniformCost { step = searchStateStep consumer resource model, cost = searchStateCost }
+                |> driversFindAllServicingGP consumer.building.entry
+                |> List.map (\d -> initRoute d consumer.building.entry)
+                |> List.map (initSearchState consumer model.buildings)
+                |> Search.uniformCost { step = searchStateStep consumer model, cost = searchStateCost }
                 |> Search.nextGoal
     in
     case result of
-        Search.Goal (Found { supplier, available, route }) _ ->
+        Search.Goal (Found { supplier, route }) _ ->
             Just
-                { supplier = supplier
-                , resource = resource
-                , available = available
+                { supplier = supplier.building
+                , resource = consumer.resource
+                , available = supplier.available
                 , route = route
-                , consumer = consumer
-                , required = required
+                , consumer = consumer.building
+                , required = consumer.required
                 }
 
         _ ->
@@ -756,15 +768,7 @@ findShortestPathToSupplier { required, resource } consumer model =
 
 type SearchState
     = Ongoing Route
-    | Found { supplier : Building, available : Int, route : Route }
-
-
-type alias Route =
-    NE RouteSegment
-
-
-type alias RouteSegment =
-    { driver : Driver, dropGP : GP }
+    | Found { supplier : Supplier, route : Route }
 
 
 withGoalStatus state =
@@ -778,41 +782,39 @@ withGoalStatus state =
     )
 
 
-initSearchState : Building -> Resource -> Buildings -> List RouteSegment -> RouteSegment -> ( SearchState, Bool )
-initSearchState consumer resource buildings prevRouteSegments routeSegment =
-    LE.findMap
-        (\b ->
-            if b.id /= consumer.id && driverCanServeGP b.entry routeSegment.driver then
-                buildingAvailableOutResource resource b
-                    |> Maybe.map
-                        (\available ->
-                            Found
-                                { supplier = b
-                                , available = available
-                                , route = ( routeSegment, prevRouteSegments )
-                                }
-                        )
-
-            else
-                Nothing
-        )
-        buildings
-        |> Maybe.withDefault (Ongoing ( routeSegment, prevRouteSegments ))
+initSearchState : Consumer -> Buildings -> Route -> ( SearchState, Bool )
+initSearchState consumer buildings route =
+    buildings
+        |> List.filter (\b -> driverCanServeGP b.entry (routeLastDriver route))
+        |> LE.findMap
+            (\b ->
+                buildingToSupplierForConsumer consumer b
+                    |> Maybe.map (\supplier -> Found { supplier = supplier, route = route })
+             -- buildingPositiveOutResourceFor consumer.building consumer.resource b
+             --     |> Maybe.map
+             --         (\available ->
+             --             Found
+             --                 { supplier = b
+             --                 , available = available
+             --                 , route = route
+             --                 }
+             --         )
+            )
+        |> Maybe.withDefault (Ongoing route)
         |> withGoalStatus
 
 
-searchStateStep : Building -> Resource -> Model -> SearchState -> List ( SearchState, Bool )
-searchStateStep consumer resource model state =
+searchStateStep : Consumer -> Model -> SearchState -> List ( SearchState, Bool )
+searchStateStep consumer model state =
     case state of
-        Ongoing (( routeSegment, restRouteSegments ) as route) ->
+        Ongoing route ->
             model.drivers
                 |> List.concatMap
                     (\d ->
-                        driversConnectedGPs d routeSegment.driver
-                            |> List.map (\gp -> { driver = d, dropGP = gp })
-                            |> List.filter (\rs -> not (NE.member rs route))
+                        driversConnectedGPs d (routeLastDriver route)
+                            |> List.filterMap (\gp -> addRouteSegment d gp route)
                     )
-                |> List.map (initSearchState consumer resource model.buildings (routeSegment :: restRouteSegments))
+                |> List.map (initSearchState consumer model.buildings)
 
         Found _ ->
             []
@@ -831,6 +833,43 @@ searchStateRoute state =
 searchStateCost : SearchState -> Float
 searchStateCost state =
     searchStateRoute state |> NE.length |> toFloat
+
+
+type alias Route =
+    NE RouteSegment
+
+
+type alias RouteSegment =
+    { driver : Driver, dropGP : GP }
+
+
+initRouteSegment : Driver -> GP -> RouteSegment
+initRouteSegment driver dropGP =
+    { driver = driver, dropGP = dropGP }
+
+
+initRoute : Driver -> GP -> Route
+initRoute driver dropGP =
+    NE.singleton (initRouteSegment driver dropGP)
+
+
+routeLastDriver : Route -> Driver
+routeLastDriver =
+    NE.head >> .driver
+
+
+addRouteSegment : Driver -> GP -> Route -> Maybe Route
+addRouteSegment driver dropGP route =
+    if routeHasDriver driver.id route then
+        Nothing
+
+    else
+        Just (NE.prependElem (initRouteSegment driver dropGP) route)
+
+
+routeHasDriver : DriverId -> Route -> Bool
+routeHasDriver driverId =
+    NE.any (.driver >> .id >> eq driverId)
 
 
 assignOrder : Order -> Model -> Model
@@ -1513,10 +1552,6 @@ type Dest
     | DestRoadPost { roadPostId : GP, gp : GP }
 
 
-
--- | DestRoadPost { id : GP, gp : GP }
-
-
 orderMatchesBuildingId : BuildingId -> Order -> Bool
 orderMatchesBuildingId bid o =
     o.from.id == bid || o.to.id == bid
@@ -2006,11 +2041,9 @@ buildingBaseOccupiesGP gp b =
 buildingLeftTopGP : Building -> GP
 buildingLeftTopGP b =
     tmap toFloat b.entry
-        -- |> subBy2 b.entryToCenterOffset
         |> add2 b.entryToCenterOffset
         |> subBy2 (tmap (toFloat >> mul 0.5) b.size)
         |> tmap round
-        |> Debug.log "debug"
 
 
 gpIntersectsSize : GP -> Int2 -> Bool
@@ -2072,24 +2105,100 @@ buildingOutStock b =
             []
 
 
+type alias Positive =
+    Int
+
+
+toPositive : Int -> Maybe Positive
+toPositive i =
+    if i > 0 then
+        Just i
+
+    else
+        Nothing
+
+
+type alias Consumer =
+    { required : Positive
+    , resource : Resource
+    , building : Building
+    }
+
+
+buildingToConsumers : Building -> List Consumer
+buildingToConsumers b =
+    b
+        |> buildingInStock
+        |> List.filterMap
+            (\inStock ->
+                inStock
+                    |> inStockItemFreeCapacity
+                    |> toPositive
+                    |> Maybe.map
+                        (\required ->
+                            { required = required
+                            , resource = inStock.resource
+                            , building = b
+                            }
+                        )
+            )
+
+
+type alias Supplier =
+    { available : Positive
+    , resource : Resource
+    , building : Building
+    }
+
+
+buildingToSupplierForConsumer : Consumer -> Building -> Maybe Supplier
+buildingToSupplierForConsumer consumer b =
+    if consumer.building.id == b.id then
+        Nothing
+
+    else
+        let
+            resource =
+                consumer.resource
+        in
+        buildingPositiveOutResource resource b
+            |> Maybe.map
+                (\available ->
+                    { available = available, resource = resource, building = b }
+                )
+
+
 buildingRequiredResources : Building -> List { required : Int, resource : Resource }
 buildingRequiredResources b =
     b |> buildingInStock |> List.map inStockItemToRequirement
 
 
-buildingAvailableOutResource : Resource -> Building -> Maybe Int
-buildingAvailableOutResource resource b =
-    case b.state of
-        UnderConstruction r ->
-            Nothing
+buildingPositiveOutResourceFor : Building -> Resource -> Building -> Maybe Positive
+buildingPositiveOutResourceFor forBuilding resource b =
+    if forBuilding.id == b.id then
+        Nothing
 
-        Producing producer ->
-            producer.outStock
-                |> LE.find (outStockItemIsResource resource)
-                |> Maybe.map .availableAndUnreserved
+    else
+        buildingPositiveOutResource resource b
 
-        NoProduction ->
-            Nothing
+
+buildingPositiveOutResource : Resource -> Building -> Maybe Positive
+buildingPositiveOutResource resource b =
+    let
+        maybeAvailable =
+            case b.state of
+                UnderConstruction r ->
+                    Nothing
+
+                Producing producer ->
+                    producer.outStock
+                        |> LE.find (outStockItemIsResource resource)
+                        |> Maybe.map .availableAndUnreserved
+
+                NoProduction ->
+                    Nothing
+    in
+    maybeAvailable |> Maybe.andThen toPositive
 
 
 buildingRemoveOrderReservationsIfAny : Orders -> Building -> Building
@@ -2346,6 +2455,11 @@ initOutStockItem capacity resource =
     { totalCapacity = capacity, resource = resource, availableAndUnreserved = 0, availableAndReservedForOrderIds = [] }
 
 
+initFilledOutStockItem : Int -> Resource -> OutStockItem
+initFilledOutStockItem capacity resource =
+    { totalCapacity = capacity, resource = resource, availableAndUnreserved = capacity, availableAndReservedForOrderIds = [] }
+
+
 outStockItemFreeCapacity : OutStockItem -> Int
 outStockItemFreeCapacity r =
     r.totalCapacity - (r.availableAndUnreserved + List.length r.availableAndReservedForOrderIds)
@@ -2484,9 +2598,6 @@ viewBuilding b =
             , strokeWidth strokeThickness
             , styleMoveToGP b.entry
             ]
-
-        -- , group [ styleMoveToGP (buildingLeftTopGP b) ]
-        --     [ words "LT" [ fill "red" ] ]
         ]
 
 
